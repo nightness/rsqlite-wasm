@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>rsqlite-wasm Demo</title>
+  <style>
+    body { font-family: monospace; max-width: 800px; margin: 40px auto; padding: 0 20px; }
+    #output { white-space: pre-wrap; background: #f4f4f4; padding: 16px; border-radius: 4px; }
+    textarea { width: 100%; height: 80px; font-family: monospace; }
+    button { margin: 8px 0; padding: 6px 16px; }
+  </style>
+</head>
+<body>
+  <h1>rsqlite-wasm Demo</h1>
+  <textarea id="sql">CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+INSERT INTO users VALUES (1, 'Alice', 30);
+INSERT INTO users VALUES (2, 'Bob', 25);
+INSERT INTO users VALUES (3, 'Charlie', 35);
+SELECT * FROM users WHERE age > 26;</textarea>
+  <br>
+  <button onclick="runSQL()">Run SQL</button>
+  <button onclick="runDemo()">Run Demo</button>
+  <pre id="output">Loading WASM...</pre>
+
+  <script type="module">
+    import init, { WasmDatabase } from './pkg/rsqlite_wasm.js';
+
+    let db;
+
+    async function setup() {
+      await init();
+      db = new WasmDatabase();
+      document.getElementById('output').textContent = 'Ready. Database created in memory.';
+    }
+
+    window.runSQL = function() {
+      const sql = document.getElementById('sql').value;
+      const out = document.getElementById('output');
+      try {
+        const statements = sql.split(';').map(s => s.trim()).filter(s => s.length > 0);
+        let result = '';
+        for (const stmt of statements) {
+          const full = stmt + ';';
+          if (stmt.toUpperCase().startsWith('SELECT')) {
+            const rows = db.query(full);
+            result += `> ${stmt}\n`;
+            result += JSON.stringify(rows, null, 2) + '\n\n';
+          } else {
+            const affected = db.exec(full);
+            result += `> ${stmt}\n`;
+            result += `OK (${affected} rows affected)\n\n`;
+          }
+        }
+        out.textContent = result;
+      } catch (e) {
+        out.textContent = 'Error: ' + e.message;
+      }
+    };
+
+    window.runDemo = function() {
+      const out = document.getElementById('output');
+      try {
+        // Fresh database
+        if (db) db.free();
+        db = new WasmDatabase();
+
+        let result = '=== rsqlite-wasm Demo ===\n\n';
+
+        db.exec('CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL, category TEXT)');
+        result += '> Created products table\n';
+
+        db.exec("INSERT INTO products VALUES (1, 'Laptop', 999.99, 'Electronics')");
+        db.exec("INSERT INTO products VALUES (2, 'Book', 19.99, 'Books')");
+        db.exec("INSERT INTO products VALUES (3, 'Phone', 699.99, 'Electronics')");
+        db.exec("INSERT INTO products VALUES (4, 'Pen', 2.99, 'Office')");
+        db.exec("INSERT INTO products VALUES (5, 'Tablet', 449.99, 'Electronics')");
+        result += '> Inserted 5 products\n\n';
+
+        result += '--- All products ---\n';
+        const all = db.query('SELECT * FROM products');
+        result += JSON.stringify(all, null, 2) + '\n\n';
+
+        result += '--- Electronics over $500 ---\n';
+        db.exec('CREATE INDEX idx_cat ON products(category)');
+        const expensive = db.query("SELECT name, price FROM products WHERE category = 'Electronics' AND price > 500");
+        result += JSON.stringify(expensive, null, 2) + '\n\n';
+
+        result += '--- Aggregates ---\n';
+        const agg = db.query('SELECT category, COUNT(*) as cnt, AVG(price) as avg_price FROM products GROUP BY category');
+        result += JSON.stringify(agg, null, 2) + '\n\n';
+
+        result += '--- JOIN example ---\n';
+        db.exec('CREATE TABLE orders (id INTEGER PRIMARY KEY, product_id INTEGER, qty INTEGER)');
+        db.exec('INSERT INTO orders VALUES (1, 1, 2)');
+        db.exec('INSERT INTO orders VALUES (2, 3, 1)');
+        db.exec('INSERT INTO orders VALUES (3, 2, 5)');
+        const joined = db.query('SELECT o.id, p.name, o.qty, p.price * o.qty as total FROM orders o INNER JOIN products p ON o.product_id = p.id');
+        result += JSON.stringify(joined, null, 2) + '\n\n';
+
+        const buf = db.toBuffer();
+        result += `--- Database export: ${buf.length} bytes ---\n`;
+
+        out.textContent = result;
+      } catch (e) {
+        out.textContent = 'Error: ' + e.message + '\n' + e.stack;
+      }
+    };
+
+    setup();
+  </script>
+</body>
+</html>
