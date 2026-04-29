@@ -23,13 +23,15 @@ pub struct ProjectionItem {
     pub alias: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum AggFunc {
     Count,
     Sum,
     Avg,
     Min,
     Max,
+    Total,
+    GroupConcat { separator: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -424,12 +426,57 @@ pub(super) fn plan_expr(expr: &Expr, columns: &[ColumnRef], catalog: &Catalog) -
 fn plan_function_expr(func: &ast::Function, columns: &[ColumnRef], catalog: &Catalog) -> Result<PlanExpr> {
     let name = func.name.to_string().to_uppercase();
 
+    if name == "GROUP_CONCAT" {
+        let (arg, separator, distinct) = match &func.args {
+            ast::FunctionArguments::List(list) => {
+                let distinct = list.duplicate_treatment
+                    == Some(ast::DuplicateTreatment::Distinct);
+                let first_arg = match list.args.first() {
+                    Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))) => {
+                        plan_expr(e, columns, catalog)?
+                    }
+                    _ => return Err(Error::Other("GROUP_CONCAT requires at least 1 argument".into())),
+                };
+                let sep = if list.args.len() > 1 {
+                    if let Some(ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e))) = list.args.get(1) {
+                        if let Expr::Value(v) = e {
+                            if let ast::Value::SingleQuotedString(s) = &v.value {
+                                Some(s.clone())
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                (first_arg, sep, distinct)
+            }
+            _ => return Err(Error::Other("GROUP_CONCAT requires arguments".into())),
+        };
+        return Ok(PlanExpr::Aggregate {
+            func: AggFunc::GroupConcat { separator },
+            arg: Box::new(arg),
+            distinct,
+        });
+    }
+
+    let arg_count = match &func.args {
+        ast::FunctionArguments::List(list) => list.args.len(),
+        _ => 0,
+    };
+
     let agg_func = match name.as_str() {
         "COUNT" => Some(AggFunc::Count),
         "SUM" => Some(AggFunc::Sum),
         "AVG" => Some(AggFunc::Avg),
-        "MIN" => Some(AggFunc::Min),
-        "MAX" => Some(AggFunc::Max),
+        "MIN" if arg_count <= 1 => Some(AggFunc::Min),
+        "MAX" if arg_count <= 1 => Some(AggFunc::Max),
+        "TOTAL" => Some(AggFunc::Total),
         _ => None,
     };
 
@@ -501,7 +548,11 @@ fn plan_function_expr(func: &ast::Function, columns: &[ColumnRef], catalog: &Cat
     static KNOWN_SCALARS: &[&str] = &[
         "LENGTH", "SUBSTR", "SUBSTRING", "UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM",
         "REPLACE", "INSTR", "COALESCE", "IFNULL", "NULLIF", "TYPEOF", "ABS", "RANDOM",
-        "HEX", "QUOTE", "ZEROBLOB", "UNICODE", "CHAR", "GLOB",
+        "HEX", "QUOTE", "ZEROBLOB", "UNICODE", "CHAR", "GLOB", "ROUND",
+        "LAST_INSERT_ROWID", "CHANGES", "TOTAL_CHANGES",
+        "PRINTF", "FORMAT",
+        "LIKELY", "UNLIKELY",
+        "MIN", "MAX",
     ];
 
     if KNOWN_SCALARS.contains(&name.as_str()) {
@@ -576,6 +627,27 @@ pub(super) fn plan_order_expr(
     output_names: &[String],
     catalog: &Catalog,
 ) -> Result<PlanExpr> {
+    if let Expr::Value(val) = expr {
+        if let ast::Value::Number(n, _) = &val.value {
+            if let Ok(idx) = n.parse::<usize>() {
+                if idx >= 1 && idx <= output_names.len() {
+                    let name = &output_names[idx - 1];
+                    if let Some(col) = table_columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(name))
+                    {
+                        return Ok(PlanExpr::Column(col.clone()));
+                    }
+                    return Ok(PlanExpr::Column(ColumnRef {
+                        name: name.clone(),
+                        column_index: 0,
+                        is_rowid_alias: false,
+                        table: None,
+                    }));
+                }
+            }
+        }
+    }
     if let Expr::Identifier(ident) = expr {
         let name = &ident.value;
         if let Some(col) = table_columns
@@ -659,7 +731,7 @@ pub(super) fn contains_aggregate(expr: &PlanExpr) -> bool {
 pub(super) fn collect_aggregates(expr: &PlanExpr, out: &mut Vec<(AggFunc, PlanExpr, bool)>) {
     match expr {
         PlanExpr::Aggregate { func, arg, distinct } => {
-            out.push((*func, arg.as_ref().clone(), *distinct));
+            out.push((func.clone(), arg.as_ref().clone(), *distinct));
         }
         PlanExpr::BinaryOp { left, right, .. } => {
             collect_aggregates(left, out);
@@ -687,6 +759,8 @@ pub fn agg_column_name(func: &AggFunc, arg: &PlanExpr, distinct: bool) -> String
         AggFunc::Avg => "AVG",
         AggFunc::Min => "MIN",
         AggFunc::Max => "MAX",
+        AggFunc::Total => "TOTAL",
+        AggFunc::GroupConcat { .. } => "GROUP_CONCAT",
     };
     let arg_str = match arg {
         PlanExpr::Wildcard => "*".to_string(),

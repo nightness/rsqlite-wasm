@@ -288,6 +288,87 @@ pub(crate) fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value> 
             let value = value_to_text(&args[1]);
             Ok(Value::Integer(if glob_match(&pattern, &value) { 1 } else { 0 }))
         }
+        "ROUND" => {
+            if args.is_empty() {
+                return Err(Error::Other("ROUND requires 1-2 arguments".into()));
+            }
+            if matches!(args[0], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let digits = if args.len() > 1 {
+                match &args[1] {
+                    Value::Integer(n) => *n as i32,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            let val = match &args[0] {
+                Value::Integer(n) => *n as f64,
+                Value::Real(f) => *f,
+                _ => 0.0,
+            };
+            let factor = 10f64.powi(digits);
+            let rounded = (val * factor).round() / factor;
+            if digits == 0 {
+                Ok(Value::Real(rounded))
+            } else {
+                Ok(Value::Real(rounded))
+            }
+        }
+        "LAST_INSERT_ROWID" => {
+            Ok(Value::Integer(super::executor::get_last_insert_rowid_pub()))
+        }
+        "CHANGES" => {
+            Ok(Value::Integer(super::executor::get_changes_pub()))
+        }
+        "TOTAL_CHANGES" => {
+            Ok(Value::Integer(super::executor::get_total_changes_pub()))
+        }
+        "PRINTF" | "FORMAT" => {
+            if args.is_empty() {
+                return Err(Error::Other("PRINTF requires at least 1 argument".into()));
+            }
+            let fmt = value_to_text(&args[0]);
+            let result = simple_printf(&fmt, &args[1..]);
+            Ok(Value::Text(result))
+        }
+        "LIKELY" | "UNLIKELY" => {
+            if args.is_empty() {
+                return Err(Error::Other(format!("{name} requires 1 argument")));
+            }
+            Ok(args[0].clone())
+        }
+        "MIN" => {
+            if args.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut min = &args[0];
+            for v in &args[1..] {
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                if compare(v, min) < 0 {
+                    min = v;
+                }
+            }
+            Ok(min.clone())
+        }
+        "MAX" => {
+            if args.is_empty() {
+                return Ok(Value::Null);
+            }
+            let mut max = &args[0];
+            for v in &args[1..] {
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                if compare(v, max) > 0 {
+                    max = v;
+                }
+            }
+            Ok(max.clone())
+        }
         _ => Err(Error::Other(format!("unknown function: {name}"))),
     }
 }
@@ -622,4 +703,57 @@ pub(crate) fn numeric_op(
         (Value::Real(a), Value::Integer(b)) => Ok(Value::Real(float_op(*a, *b as f64))),
         _ => Ok(Value::Integer(0)),
     }
+}
+
+fn simple_printf(fmt: &str, args: &[Value]) -> String {
+    let mut result = String::new();
+    let mut chars = fmt.chars().peekable();
+    let mut arg_idx = 0;
+
+    while let Some(ch) = chars.next() {
+        if ch == '%' {
+            match chars.peek() {
+                Some('%') => {
+                    chars.next();
+                    result.push('%');
+                }
+                Some('d' | 'i') => {
+                    chars.next();
+                    if let Some(val) = args.get(arg_idx) {
+                        match val {
+                            Value::Integer(n) => result.push_str(&n.to_string()),
+                            Value::Real(f) => result.push_str(&(*f as i64).to_string()),
+                            _ => result.push('0'),
+                        }
+                    }
+                    arg_idx += 1;
+                }
+                Some('f') => {
+                    chars.next();
+                    if let Some(val) = args.get(arg_idx) {
+                        match val {
+                            Value::Real(f) => result.push_str(&format!("{:.6}", f)),
+                            Value::Integer(n) => result.push_str(&format!("{:.6}", *n as f64)),
+                            _ => result.push_str("0.000000"),
+                        }
+                    }
+                    arg_idx += 1;
+                }
+                Some('s') => {
+                    chars.next();
+                    if let Some(val) = args.get(arg_idx) {
+                        result.push_str(&value_to_text(val));
+                    }
+                    arg_idx += 1;
+                }
+                _ => {
+                    result.push('%');
+                }
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
 }

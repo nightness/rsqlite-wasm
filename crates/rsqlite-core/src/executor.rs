@@ -22,6 +22,9 @@ use crate::types::{QueryResult, Row};
 
 thread_local! {
     static BOUND_PARAMS: RefCell<Vec<Value>> = RefCell::new(Vec::new());
+    static LAST_INSERT_ROWID: RefCell<i64> = RefCell::new(0);
+    static LAST_CHANGES: RefCell<i64> = RefCell::new(0);
+    static TOTAL_CHANGES_COUNT: RefCell<i64> = RefCell::new(0);
 }
 
 pub fn set_params(params: Vec<Value>) {
@@ -39,6 +42,39 @@ fn get_param(index: usize) -> Value {
             .cloned()
             .unwrap_or(Value::Null)
     })
+}
+
+fn set_last_insert_rowid(rowid: i64) {
+    LAST_INSERT_ROWID.with(|r| *r.borrow_mut() = rowid);
+}
+
+fn get_last_insert_rowid() -> i64 {
+    LAST_INSERT_ROWID.with(|r| *r.borrow())
+}
+
+fn set_changes(count: i64) {
+    LAST_CHANGES.with(|c| *c.borrow_mut() = count);
+    TOTAL_CHANGES_COUNT.with(|t| *t.borrow_mut() += count);
+}
+
+fn get_changes() -> i64 {
+    LAST_CHANGES.with(|c| *c.borrow())
+}
+
+fn get_total_changes() -> i64 {
+    TOTAL_CHANGES_COUNT.with(|t| *t.borrow())
+}
+
+pub fn get_last_insert_rowid_pub() -> i64 {
+    get_last_insert_rowid()
+}
+
+pub fn get_changes_pub() -> i64 {
+    get_changes()
+}
+
+pub fn get_total_changes_pub() -> i64 {
+    get_total_changes()
 }
 
 #[derive(Debug)]
@@ -191,6 +227,7 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
         | Plan::DropIndex { .. }
         | Plan::DropView { .. }
         | Plan::CreateView { .. }
+        | Plan::CreateTableAsSelect { .. }
         | Plan::Begin
         | Plan::Commit
         | Plan::Rollback => Err(Error::Other(
@@ -234,6 +271,11 @@ pub fn execute_mut(
         Plan::DropView { name, if_exists } => {
             execute_drop_view(name, *if_exists, pager, catalog)
         }
+        Plan::CreateTableAsSelect {
+            table_name,
+            if_not_exists,
+            query,
+        } => execute_create_table_as_select(table_name, *if_not_exists, query, pager, catalog),
         Plan::Begin => {
             pager.begin_transaction()?;
             Ok(ExecResult { rows_affected: 0 })
@@ -441,6 +483,66 @@ fn execute_create_table(
     catalog.reload(pager)?;
 
     Ok(ExecResult { rows_affected: 0 })
+}
+
+fn execute_create_table_as_select(
+    table_name: &str,
+    if_not_exists: bool,
+    query: &Plan,
+    pager: &mut Pager,
+    catalog: &mut Catalog,
+) -> Result<ExecResult> {
+    if if_not_exists && catalog.get_table(table_name).is_some() {
+        return Ok(ExecResult { rows_affected: 0 });
+    }
+
+    if catalog.get_table(table_name).is_some() {
+        return Err(Error::Other(format!(
+            "table {table_name} already exists"
+        )));
+    }
+
+    let query_result = execute(query, pager, catalog)?;
+
+    let col_defs: Vec<String> = query_result
+        .columns
+        .iter()
+        .map(|name| {
+            let clean = name.rsplit('.').next().unwrap_or(name);
+            format!("{clean} TEXT")
+        })
+        .collect();
+    let create_sql = format!(
+        "CREATE TABLE {table_name} ({})",
+        col_defs.join(", ")
+    );
+
+    let root_page = btree_create_table(pager)?;
+
+    insert_schema_entry(pager, "table", table_name, table_name, root_page, &create_sql)?;
+
+    if !pager.in_transaction() {
+        pager.flush()?;
+    }
+
+    catalog.reload(pager)?;
+
+    let mut current_root = root_page;
+    let mut rows_affected = 0u64;
+    for (i, row) in query_result.rows.iter().enumerate() {
+        let rowid = (i + 1) as i64;
+        let record = Record {
+            values: row.values.clone(),
+        };
+        current_root = btree_insert(pager, current_root, rowid, &record)?;
+        rows_affected += 1;
+    }
+
+    if !pager.in_transaction() {
+        pager.flush()?;
+    }
+
+    Ok(ExecResult { rows_affected })
 }
 
 fn execute_create_index(
@@ -805,6 +907,46 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
     let mut rows_affected = 0u64;
     let mut current_root = plan.root_page;
 
+    if let Some(source) = &plan.source_query {
+        let query_result = execute(source, pager, catalog)?;
+        for row in &query_result.rows {
+            let values = map_query_row_to_insert(
+                &row.values,
+                &plan.table_columns,
+                &plan.target_columns,
+            )?;
+
+            let mut rowid = None;
+            for (i, col) in plan.table_columns.iter().enumerate() {
+                if col.is_rowid_alias {
+                    if let Value::Integer(id) = &values[i] {
+                        rowid = Some(*id);
+                    }
+                }
+            }
+            let rowid = match rowid {
+                Some(id) => id,
+                None => btree_max_rowid(pager, current_root)? + 1,
+            };
+
+            let record = Record { values: values.clone() };
+            current_root = btree_insert(pager, current_root, rowid, &record)?;
+            for (idx_root, idx_col_indices) in &table_indexes {
+                let key = build_index_key(&values, idx_col_indices, &plan.table_columns, rowid);
+                btree_index_insert(pager, *idx_root, &key)
+                    .map_err(|e| Error::Other(e.to_string()))?;
+            }
+            rows_affected += 1;
+        }
+
+        if !pager.in_transaction() {
+            pager.flush()?;
+        }
+        set_changes(rows_affected as i64);
+        return Ok(ExecResult { rows_affected });
+    }
+
+    let mut last_rowid = 0i64;
     for row_exprs in &plan.rows {
         let values = eval_insert_row(row_exprs, &plan.table_columns, &plan.target_columns)?;
 
@@ -822,7 +964,21 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
             None => btree_max_rowid(pager, current_root)? + 1,
         };
 
-        if let Some(on_conflict) = &plan.on_conflict {
+        if plan.or_replace && btree_row_exists(pager, current_root, rowid)? {
+            let old_values =
+                read_row_by_rowid(pager, current_root, rowid, &plan.table_columns)?;
+            for (idx_root, idx_col_indices) in &table_indexes {
+                let old_key = build_index_key(
+                    &old_values,
+                    idx_col_indices,
+                    &plan.table_columns,
+                    rowid,
+                );
+                let _ = btree_index_delete(pager, *idx_root, &old_key);
+            }
+            btree_delete(pager, current_root, rowid)
+                .map_err(|e| Error::Other(e.to_string()))?;
+        } else if let Some(on_conflict) = &plan.on_conflict {
             if btree_row_exists(pager, current_root, rowid)? {
                 match on_conflict {
                     OnConflictPlan::DoNothing => continue,
@@ -883,6 +1039,7 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
             values: values.clone(),
         };
         current_root = btree_insert(pager, current_root, rowid, &record)?;
+        last_rowid = rowid;
 
         for (idx_root, idx_col_indices) in &table_indexes {
             let key = build_index_key(&values, idx_col_indices, &plan.table_columns, rowid);
@@ -897,7 +1054,36 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
         pager.flush()?;
     }
 
+    set_last_insert_rowid(last_rowid);
+    set_changes(rows_affected as i64);
     Ok(ExecResult { rows_affected })
+}
+
+fn map_query_row_to_insert(
+    query_values: &[Value],
+    table_columns: &[ColumnRef],
+    target_columns: &Option<Vec<String>>,
+) -> Result<Vec<Value>> {
+    let num_table_cols = table_columns.len();
+    let mut values = vec![Value::Null; num_table_cols];
+
+    if let Some(targets) = target_columns {
+        for (i, col_name) in targets.iter().enumerate() {
+            let idx = table_columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                .ok_or_else(|| Error::Other(format!("unknown column: {col_name}")))?;
+            values[idx] = query_values.get(i).cloned().unwrap_or(Value::Null);
+        }
+    } else {
+        for (i, val) in query_values.iter().enumerate() {
+            if i < num_table_cols {
+                values[i] = val.clone();
+            }
+        }
+    }
+
+    Ok(values)
 }
 
 fn read_row_by_rowid(
@@ -1235,6 +1421,7 @@ fn execute_update(plan: &UpdatePlan, pager: &mut Pager, catalog: &Catalog) -> Re
         pager.flush()?;
     }
 
+    set_changes(rows_affected as i64);
     Ok(ExecResult { rows_affected })
 }
 
@@ -1298,6 +1485,7 @@ fn execute_delete(plan: &DeletePlan, pager: &mut Pager, catalog: &Catalog) -> Re
         pager.flush()?;
     }
 
+    set_changes(rows_affected as i64);
     Ok(ExecResult { rows_affected })
 }
 
@@ -1839,6 +2027,48 @@ fn compute_aggregate(
                 });
             }
             Ok(max.unwrap_or(Value::Null))
+        }
+        AggFunc::Total => {
+            let mut sum = 0f64;
+            let mut seen = std::collections::HashSet::new();
+            for row in rows {
+                let val = eval_expr(arg, row, columns, pager, catalog)?;
+                if matches!(val, Value::Null) {
+                    continue;
+                }
+                if distinct && !seen.insert(value_hash_key(&val)) {
+                    continue;
+                }
+                match &val {
+                    Value::Integer(n) => sum += *n as f64,
+                    Value::Real(f) => sum += f,
+                    _ => {}
+                }
+            }
+            Ok(Value::Real(sum))
+        }
+        AggFunc::GroupConcat { separator } => {
+            let sep = separator.as_deref().unwrap_or(",");
+            let mut parts = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for row in rows {
+                let val = eval_expr(arg, row, columns, pager, catalog)?;
+                if matches!(val, Value::Null) {
+                    continue;
+                }
+                let text = value_to_text(&val);
+                if distinct {
+                    if !seen.insert(text.clone()) {
+                        continue;
+                    }
+                }
+                parts.push(text);
+            }
+            if parts.is_empty() {
+                Ok(Value::Null)
+            } else {
+                Ok(Value::Text(parts.join(sep)))
+            }
         }
     }
 }

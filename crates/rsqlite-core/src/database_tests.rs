@@ -2876,3 +2876,235 @@
         assert_eq!(r.rows.len(), 1);
         assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(2));
     }
+
+    #[test]
+    fn insert_select_all_columns() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)").unwrap();
+        db.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)").unwrap();
+        db.execute("INSERT INTO src VALUES (1, 'a', 10)").unwrap();
+        db.execute("INSERT INTO src VALUES (2, 'b', 20)").unwrap();
+        db.execute("INSERT INTO src VALUES (3, 'c', 30)").unwrap();
+        db.execute("INSERT INTO dst SELECT * FROM src WHERE val > 10").unwrap();
+        let r = db.query("SELECT name, val FROM dst ORDER BY val").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("b".into()));
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(20));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Text("c".into()));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Integer(30));
+    }
+
+    #[test]
+    fn insert_select_subset_columns() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)").unwrap();
+        db.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("INSERT INTO src VALUES (1, 'alpha', 10)").unwrap();
+        db.execute("INSERT INTO src VALUES (2, 'beta', 20)").unwrap();
+        db.execute("INSERT INTO dst (label) SELECT name FROM src ORDER BY name").unwrap();
+        let r = db.query("SELECT label FROM dst ORDER BY label").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("alpha".into()));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Text("beta".into()));
+    }
+
+    #[test]
+    fn insert_select_with_expression() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+        db.execute("CREATE TABLE dst (id INTEGER PRIMARY KEY, doubled INTEGER)").unwrap();
+        db.execute("INSERT INTO src VALUES (1, 5)").unwrap();
+        db.execute("INSERT INTO src VALUES (2, 10)").unwrap();
+        db.execute("INSERT INTO dst (doubled) SELECT val * 2 FROM src").unwrap();
+        let r = db.query("SELECT doubled FROM dst ORDER BY doubled").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(10));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Integer(20));
+    }
+
+    #[test]
+    fn group_concat_basic() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, grp TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alice', 'a')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'bob', 'a')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'carol', 'b')").unwrap();
+        let r = db.query("SELECT grp, GROUP_CONCAT(name) FROM t GROUP BY grp ORDER BY grp").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Text("alice,bob".into()));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Text("carol".into()));
+    }
+
+    #[test]
+    fn group_concat_custom_separator() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'c')").unwrap();
+        let r = db.query("SELECT GROUP_CONCAT(name, ' | ') FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("a | b | c".into()));
+    }
+
+    #[test]
+    fn group_concat_distinct() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'y')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'x')").unwrap();
+        let r = db.query("SELECT GROUP_CONCAT(DISTINCT val) FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("x,y".into()));
+    }
+
+    #[test]
+    fn total_aggregate() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        let r = db.query("SELECT TOTAL(val) FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Real(30.0));
+
+        let r2 = db.query("SELECT TOTAL(val) FROM t WHERE id > 100").unwrap();
+        assert_eq!(r2.rows[0].values[0], crate::types::Value::Real(0.0));
+    }
+
+    #[test]
+    fn round_function() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        let r = db.query("SELECT ROUND(3.14159)").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Real(3.0));
+
+        let r2 = db.query("SELECT ROUND(3.14159, 2)").unwrap();
+        assert_eq!(r2.rows[0].values[0], crate::types::Value::Real(3.14));
+    }
+
+    #[test]
+    fn scalar_min_max() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        let r = db.query("SELECT MIN(3, 1, 2)").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(1));
+
+        let r2 = db.query("SELECT MAX(3, 1, 2)").unwrap();
+        assert_eq!(r2.rows[0].values[0], crate::types::Value::Integer(3));
+    }
+
+    #[test]
+    fn last_insert_rowid_function() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (42, 'test')").unwrap();
+        let r = db.query("SELECT LAST_INSERT_ROWID()").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(42));
+    }
+
+    #[test]
+    fn changes_function() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+        db.execute("DELETE FROM t WHERE val > 10").unwrap();
+        let r = db.query("SELECT CHANGES()").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(2));
+    }
+
+    #[test]
+    fn insert_or_replace() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'original')").unwrap();
+        db.execute("INSERT OR REPLACE INTO t VALUES (1, 'replaced')").unwrap();
+        let r = db.query("SELECT name FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("replaced".into()));
+    }
+
+    #[test]
+    fn replace_into() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+        db.execute("REPLACE INTO t VALUES (1, 'second')").unwrap();
+        db.execute("REPLACE INTO t VALUES (2, 'new')").unwrap();
+        let r = db.query("SELECT id, name FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Text("second".into()));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Text("new".into()));
+    }
+
+    #[test]
+    fn printf_function() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        let r = db.query("SELECT PRINTF('hello %s, you are %d', 'world', 42)").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("hello world, you are 42".into()));
+    }
+
+    #[test]
+    fn insert_or_ignore() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+        db.execute("INSERT OR IGNORE INTO t VALUES (1, 'ignored')").unwrap();
+        db.execute("INSERT OR IGNORE INTO t VALUES (2, 'second')").unwrap();
+        let r = db.query("SELECT id, name FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Text("first".into()));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Text("second".into()));
+    }
+
+    #[test]
+    fn order_by_column_number() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'c', 30)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'a', 10)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'b', 20)").unwrap();
+        let r = db.query("SELECT name, val FROM t ORDER BY 2").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("a".into()));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Text("b".into()));
+        assert_eq!(r.rows[2].values[0], crate::types::Value::Text("c".into()));
+    }
+
+    #[test]
+    fn create_table_as_select() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE src (id INTEGER PRIMARY KEY, name TEXT, val INTEGER)").unwrap();
+        db.execute("INSERT INTO src VALUES (1, 'alice', 100)").unwrap();
+        db.execute("INSERT INTO src VALUES (2, 'bob', 200)").unwrap();
+        db.execute("CREATE TABLE dst AS SELECT name, val FROM src WHERE val > 100").unwrap();
+        let r = db.query("SELECT name, val FROM dst").unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("bob".into()));
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(200));
+    }
+
+    #[test]
+    fn create_table_as_select_if_not_exists() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'test')").unwrap();
+        db.execute("CREATE TABLE IF NOT EXISTS t AS SELECT * FROM t").unwrap();
+        let r = db.query("SELECT * FROM t").unwrap();
+        assert_eq!(r.rows.len(), 1);
+    }

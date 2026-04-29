@@ -53,7 +53,9 @@ pub struct InsertPlan {
     pub table_columns: Vec<ColumnRef>,
     pub target_columns: Option<Vec<String>>,
     pub rows: Vec<Vec<PlanExpr>>,
+    pub source_query: Option<Box<Plan>>,
     pub on_conflict: Option<OnConflictPlan>,
+    pub or_replace: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +190,11 @@ pub enum Plan {
         name: String,
         if_exists: bool,
     },
+    CreateTableAsSelect {
+        table_name: String,
+        if_not_exists: bool,
+        query: Box<Plan>,
+    },
     Pragma {
         name: String,
         argument: Option<String>,
@@ -201,7 +208,7 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
     reset_param_counter();
     match stmt {
         Statement::Query(query) => plan_select(query, catalog, &HashMap::new()),
-        Statement::CreateTable(ct) => plan_create_table(ct),
+        Statement::CreateTable(ct) => plan_create_table(ct, catalog),
         Statement::CreateIndex(ci) => plan_create_index(ci),
         Statement::Insert(insert) => plan_insert(insert, catalog),
         Statement::Update {
@@ -743,8 +750,17 @@ fn plan_join_constraint(
     }
 }
 
-fn plan_create_table(ct: &ast::CreateTable) -> Result<Plan> {
+fn plan_create_table(ct: &ast::CreateTable, catalog: &Catalog) -> Result<Plan> {
     let table_name = ct.name.to_string();
+
+    if let Some(query) = &ct.query {
+        let query_plan = plan_select(query, catalog, &HashMap::new())?;
+        return Ok(Plan::CreateTableAsSelect {
+            table_name,
+            if_not_exists: ct.if_not_exists,
+            query: Box::new(query_plan),
+        });
+    }
 
     let mut columns = Vec::new();
 
@@ -1190,9 +1206,9 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
         )
     };
 
-    let rows = match insert.source.as_ref() {
+    let (rows, source_query) = match insert.source.as_ref() {
         None => {
-            vec![vec![]]
+            (vec![vec![]], None)
         }
         Some(source) => match source.body.as_ref() {
             SetExpr::Values(values) => {
@@ -1204,37 +1220,45 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
                     }
                     planned_rows.push(exprs);
                 }
-                planned_rows
+                (planned_rows, None)
             }
             _ => {
-                return Err(Error::Other(
-                    "only INSERT ... VALUES is supported".to_string(),
-                ))
+                let query_plan = plan_select(source, catalog, &HashMap::new())?;
+                (vec![], Some(Box::new(query_plan)))
             }
         },
     };
 
-    let on_conflict = match &insert.on {
-        Some(ast::OnInsert::OnConflict(oc)) => match &oc.action {
-            ast::OnConflictAction::DoNothing => Some(OnConflictPlan::DoNothing),
-            ast::OnConflictAction::DoUpdate(do_update) => {
-                let mut assignments = Vec::new();
-                for assign in &do_update.assignments {
-                    let col_name = match &assign.target {
-                        ast::AssignmentTarget::ColumnName(name) => name.to_string(),
-                        ast::AssignmentTarget::Tuple(_) => {
-                            return Err(Error::Other(
-                                "tuple assignment not supported".to_string(),
-                            ))
-                        }
-                    };
-                    let expr = plan_expr(&assign.value, &all_columns, catalog)?;
-                    assignments.push((col_name, expr));
+    let or_replace = insert.replace_into
+        || matches!(insert.or, Some(ast::SqliteOnConflict::Replace));
+
+    let on_conflict = if matches!(insert.or, Some(ast::SqliteOnConflict::Ignore)) {
+        Some(OnConflictPlan::DoNothing)
+    } else if matches!(insert.or, Some(ast::SqliteOnConflict::Abort)) {
+        None
+    } else {
+        match &insert.on {
+            Some(ast::OnInsert::OnConflict(oc)) => match &oc.action {
+                ast::OnConflictAction::DoNothing => Some(OnConflictPlan::DoNothing),
+                ast::OnConflictAction::DoUpdate(do_update) => {
+                    let mut assignments = Vec::new();
+                    for assign in &do_update.assignments {
+                        let col_name = match &assign.target {
+                            ast::AssignmentTarget::ColumnName(name) => name.to_string(),
+                            ast::AssignmentTarget::Tuple(_) => {
+                                return Err(Error::Other(
+                                    "tuple assignment not supported".to_string(),
+                                ))
+                            }
+                        };
+                        let expr = plan_expr(&assign.value, &all_columns, catalog)?;
+                        assignments.push((col_name, expr));
+                    }
+                    Some(OnConflictPlan::DoUpdate { assignments })
                 }
-                Some(OnConflictPlan::DoUpdate { assignments })
-            }
-        },
-        _ => None,
+            },
+            _ => None,
+        }
     };
 
     Ok(Plan::Insert(InsertPlan {
@@ -1243,7 +1267,9 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
         table_columns: all_columns,
         target_columns,
         rows,
+        source_query,
         on_conflict,
+        or_replace,
     }))
 }
 

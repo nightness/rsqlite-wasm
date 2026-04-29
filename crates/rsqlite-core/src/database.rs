@@ -75,6 +75,7 @@ impl Database {
                 | Plan::AlterTableRename { .. }
                 | Plan::CreateView { .. }
                 | Plan::DropView { .. }
+                | Plan::CreateTableAsSelect { .. }
         );
         let result = executor::execute_mut(&plan, &mut self.pager, &mut self.catalog)?;
         if is_ddl {
@@ -132,6 +133,7 @@ impl Database {
                     | Plan::AlterTableRename { .. }
                     | Plan::CreateView { .. }
                     | Plan::DropView { .. }
+                    | Plan::CreateTableAsSelect { .. }
             );
             let result = executor::execute_mut(
                 &plan,
