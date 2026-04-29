@@ -4,6 +4,31 @@ use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 
 #[derive(Debug, Clone)]
+pub struct CreateTablePlan {
+    pub table_name: String,
+    pub sql: String,
+    pub columns: Vec<CreateColumnDef>,
+    pub if_not_exists: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateColumnDef {
+    pub name: String,
+    pub type_name: String,
+    pub is_primary_key: bool,
+    pub not_null: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertPlan {
+    pub table_name: String,
+    pub root_page: u32,
+    pub table_columns: Vec<ColumnRef>,
+    pub target_columns: Option<Vec<String>>,
+    pub rows: Vec<Vec<PlanExpr>>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Plan {
     Scan {
         table: String,
@@ -18,6 +43,8 @@ pub enum Plan {
         input: Box<Plan>,
         outputs: Vec<ProjectionItem>,
     },
+    CreateTable(CreateTablePlan),
+    Insert(InsertPlan),
 }
 
 #[derive(Debug, Clone)]
@@ -84,13 +111,19 @@ pub enum UnaryOp {
     Neg,
 }
 
-pub fn plan_query(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
+pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
     match stmt {
         Statement::Query(query) => plan_select(query, catalog),
+        Statement::CreateTable(ct) => plan_create_table(ct),
+        Statement::Insert(insert) => plan_insert(insert, catalog),
         _ => Err(Error::Other(format!(
             "unsupported statement type: {stmt}"
         ))),
     }
+}
+
+pub fn plan_query(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
+    plan_statement(stmt, catalog)
 }
 
 fn plan_select(query: &ast::Query, catalog: &Catalog) -> Result<Plan> {
@@ -293,4 +326,128 @@ fn plan_binop(op: &ast::BinaryOperator) -> Result<BinOp> {
         ast::BinaryOperator::Modulo => Ok(BinOp::Mod),
         _ => Err(Error::Other(format!("unsupported operator: {op}"))),
     }
+}
+
+fn plan_create_table(ct: &ast::CreateTable) -> Result<Plan> {
+    let table_name = ct.name.to_string();
+
+    let mut columns = Vec::new();
+
+    // Collect table-level PK columns
+    let mut table_pk_cols: Vec<String> = Vec::new();
+    for constraint in &ct.constraints {
+        if let ast::TableConstraint::PrimaryKey {
+            columns: pk_cols, ..
+        } = constraint
+        {
+            for col in pk_cols {
+                table_pk_cols.push(col.value.to_lowercase());
+            }
+        }
+    }
+
+    for col in &ct.columns {
+        let type_name = col.data_type.to_string();
+        let is_pk_inline = col.options.iter().any(|opt| {
+            matches!(
+                opt.option,
+                ast::ColumnOption::Unique {
+                    is_primary: true,
+                    ..
+                }
+            )
+        });
+        let is_pk_from_table = table_pk_cols.contains(&col.name.value.to_lowercase());
+        let is_primary_key = is_pk_inline || is_pk_from_table;
+
+        let not_null = col
+            .options
+            .iter()
+            .any(|opt| matches!(opt.option, ast::ColumnOption::NotNull))
+            || is_primary_key;
+
+        columns.push(CreateColumnDef {
+            name: col.name.value.clone(),
+            type_name,
+            is_primary_key,
+            not_null,
+        });
+    }
+
+    let sql = format!("{ct}");
+
+    Ok(Plan::CreateTable(CreateTablePlan {
+        table_name,
+        sql,
+        columns,
+        if_not_exists: ct.if_not_exists,
+    }))
+}
+
+fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
+    let table_name = match &insert.table {
+        ast::TableObject::TableName(name) => name.to_string(),
+        _ => {
+            return Err(Error::Other(
+                "only simple table names are supported in INSERT".to_string(),
+            ))
+        }
+    };
+
+    let table_def = catalog.get_table(&table_name).ok_or_else(|| {
+        Error::Other(format!("table not found: {table_name}"))
+    })?;
+
+    let all_columns: Vec<ColumnRef> = table_def
+        .columns
+        .iter()
+        .map(|c| ColumnRef {
+            name: c.name.clone(),
+            column_index: c.column_index,
+            is_rowid_alias: c.is_rowid_alias,
+        })
+        .collect();
+
+    let target_columns = if insert.columns.is_empty() {
+        None
+    } else {
+        Some(
+            insert
+                .columns
+                .iter()
+                .map(|c| c.value.clone())
+                .collect(),
+        )
+    };
+
+    let source = insert.source.as_ref().ok_or_else(|| {
+        Error::Other("INSERT requires VALUES".to_string())
+    })?;
+
+    let rows = match source.body.as_ref() {
+        SetExpr::Values(values) => {
+            let mut planned_rows = Vec::new();
+            for row in &values.rows {
+                let mut exprs = Vec::new();
+                for expr in row {
+                    exprs.push(plan_expr(expr, &all_columns)?);
+                }
+                planned_rows.push(exprs);
+            }
+            planned_rows
+        }
+        _ => {
+            return Err(Error::Other(
+                "only INSERT ... VALUES is supported".to_string(),
+            ))
+        }
+    };
+
+    Ok(Plan::Insert(InsertPlan {
+        table_name,
+        root_page: table_def.root_page,
+        table_columns: all_columns,
+        target_columns,
+        rows,
+    }))
 }

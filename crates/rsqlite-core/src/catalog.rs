@@ -105,6 +105,13 @@ impl Catalog {
     pub fn get_table(&self, name: &str) -> Option<&TableDef> {
         self.tables.get(&name.to_lowercase())
     }
+
+    pub fn reload(&mut self, pager: &mut Pager) -> Result<()> {
+        let fresh = Self::load(pager)?;
+        self.tables = fresh.tables;
+        self.indexes = fresh.indexes;
+        Ok(())
+    }
 }
 
 fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {

@@ -1,10 +1,20 @@
-use rsqlite_storage::btree::BTreeCursor;
-use rsqlite_storage::codec::Value;
+use rsqlite_storage::btree::{
+    btree_create_table, btree_insert, btree_max_rowid, insert_schema_entry, BTreeCursor,
+};
+use rsqlite_storage::codec::{Record, Value};
 use rsqlite_storage::pager::Pager;
 
+use crate::catalog::Catalog;
 use crate::error::{Error, Result};
-use crate::planner::{BinOp, ColumnRef, LiteralValue, Plan, PlanExpr, ProjectionItem, UnaryOp};
+use crate::planner::{
+    BinOp, ColumnRef, CreateTablePlan, InsertPlan, LiteralValue, Plan, PlanExpr, ProjectionItem,
+    UnaryOp,
+};
 use crate::types::{QueryResult, Row};
+
+pub struct ExecResult {
+    pub rows_affected: u64,
+}
 
 pub fn execute(plan: &Plan, pager: &mut Pager) -> Result<QueryResult> {
     match plan {
@@ -29,6 +39,145 @@ pub fn execute(plan: &Plan, pager: &mut Pager) -> Result<QueryResult> {
             columns,
             ..
         } => execute_scan(*root_page, columns, pager),
+        Plan::CreateTable(_) | Plan::Insert(_) => Err(Error::Other(
+            "use execute_mut for DDL/DML statements".to_string(),
+        )),
+    }
+}
+
+pub fn execute_mut(
+    plan: &Plan,
+    pager: &mut Pager,
+    catalog: &mut Catalog,
+) -> Result<ExecResult> {
+    match plan {
+        Plan::CreateTable(ct) => execute_create_table(ct, pager, catalog),
+        Plan::Insert(ins) => execute_insert(ins, pager),
+        _ => Err(Error::Other(
+            "use execute for query statements".to_string(),
+        )),
+    }
+}
+
+fn execute_create_table(
+    plan: &CreateTablePlan,
+    pager: &mut Pager,
+    catalog: &mut Catalog,
+) -> Result<ExecResult> {
+    if plan.if_not_exists && catalog.get_table(&plan.table_name).is_some() {
+        return Ok(ExecResult { rows_affected: 0 });
+    }
+
+    if catalog.get_table(&plan.table_name).is_some() {
+        return Err(Error::Other(format!(
+            "table {} already exists",
+            plan.table_name
+        )));
+    }
+
+    let root_page = btree_create_table(pager)?;
+
+    insert_schema_entry(
+        pager,
+        "table",
+        &plan.table_name,
+        &plan.table_name,
+        root_page,
+        &plan.sql,
+    )?;
+
+    pager.flush()?;
+
+    catalog.reload(pager)?;
+
+    Ok(ExecResult { rows_affected: 0 })
+}
+
+fn execute_insert(plan: &InsertPlan, pager: &mut Pager) -> Result<ExecResult> {
+    let mut rows_affected = 0u64;
+    let mut current_root = plan.root_page;
+
+    for row_exprs in &plan.rows {
+        let values = eval_insert_row(row_exprs, &plan.table_columns, &plan.target_columns)?;
+
+        let mut rowid = None;
+        for (i, col) in plan.table_columns.iter().enumerate() {
+            if col.is_rowid_alias {
+                if let Value::Integer(id) = &values[i] {
+                    rowid = Some(*id);
+                }
+            }
+        }
+
+        let rowid = match rowid {
+            Some(id) => id,
+            None => btree_max_rowid(pager, current_root)? + 1,
+        };
+
+        let record = Record { values };
+        current_root = btree_insert(pager, current_root, rowid, &record)?;
+        rows_affected += 1;
+    }
+
+    pager.flush()?;
+
+    Ok(ExecResult { rows_affected })
+}
+
+fn eval_insert_row(
+    row_exprs: &[PlanExpr],
+    table_columns: &[ColumnRef],
+    target_columns: &Option<Vec<String>>,
+) -> Result<Vec<Value>> {
+    match target_columns {
+        None => {
+            let mut values = Vec::with_capacity(table_columns.len());
+            for (i, col) in table_columns.iter().enumerate() {
+                if i < row_exprs.len() {
+                    values.push(eval_literal(&row_exprs[i])?);
+                } else if col.is_rowid_alias {
+                    values.push(Value::Null);
+                } else {
+                    values.push(Value::Null);
+                }
+            }
+            Ok(values)
+        }
+        Some(target_cols) => {
+            let mut values = vec![Value::Null; table_columns.len()];
+            for (i, target_name) in target_cols.iter().enumerate() {
+                let col_idx = table_columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(target_name))
+                    .ok_or_else(|| {
+                        Error::Other(format!("unknown column: {target_name}"))
+                    })?;
+                if i < row_exprs.len() {
+                    values[col_idx] = eval_literal(&row_exprs[i])?;
+                }
+            }
+            Ok(values)
+        }
+    }
+}
+
+fn eval_literal(expr: &PlanExpr) -> Result<Value> {
+    match expr {
+        PlanExpr::Literal(lit) => Ok(literal_to_value(lit)),
+        PlanExpr::UnaryOp {
+            op: UnaryOp::Neg,
+            operand,
+        } => {
+            let v = eval_literal(operand)?;
+            match v {
+                Value::Integer(n) => Ok(Value::Integer(-n)),
+                Value::Real(f) => Ok(Value::Real(-f)),
+                _ => Ok(Value::Integer(0)),
+            }
+        }
+        _ => Err(Error::Other(
+            "only literal values are supported in INSERT".to_string(),
+        )),
     }
 }
 
