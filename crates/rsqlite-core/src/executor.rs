@@ -1,6 +1,7 @@
 use rsqlite_storage::btree::{
     btree_create_index, btree_create_table, btree_delete, btree_index_delete, btree_index_insert,
-    btree_insert, btree_max_rowid, insert_schema_entry, BTreeCursor, CursorRow, IndexCursor,
+    btree_insert, btree_max_rowid, delete_schema_entries, insert_schema_entry, BTreeCursor,
+    CursorRow, IndexCursor,
 };
 use rsqlite_storage::codec::{Record, Value};
 use rsqlite_storage::pager::Pager;
@@ -115,6 +116,8 @@ pub fn execute(plan: &Plan, pager: &mut Pager) -> Result<QueryResult> {
         | Plan::Insert(_)
         | Plan::Update(_)
         | Plan::Delete(_)
+        | Plan::DropTable { .. }
+        | Plan::DropIndex { .. }
         | Plan::Begin
         | Plan::Commit
         | Plan::Rollback => Err(Error::Other(
@@ -134,6 +137,14 @@ pub fn execute_mut(
         Plan::Insert(ins) => execute_insert(ins, pager, catalog),
         Plan::Update(upd) => execute_update(upd, pager, catalog),
         Plan::Delete(del) => execute_delete(del, pager, catalog),
+        Plan::DropTable {
+            table_name,
+            if_exists,
+        } => execute_drop_table(table_name, *if_exists, pager, catalog),
+        Plan::DropIndex {
+            index_name,
+            if_exists,
+        } => execute_drop_index(index_name, *if_exists, pager, catalog),
         Plan::Begin => {
             pager.begin_transaction()?;
             Ok(ExecResult { rows_affected: 0 })
@@ -431,6 +442,52 @@ fn execute_create_index(
 
     catalog.reload(pager)?;
 
+    Ok(ExecResult { rows_affected: 0 })
+}
+
+fn execute_drop_table(
+    table_name: &str,
+    if_exists: bool,
+    pager: &mut Pager,
+    catalog: &mut Catalog,
+) -> Result<ExecResult> {
+    if catalog.get_table(table_name).is_none() {
+        if if_exists {
+            return Ok(ExecResult { rows_affected: 0 });
+        }
+        return Err(Error::Other(format!("no such table: {table_name}")));
+    }
+
+    delete_schema_entries(pager, table_name).map_err(|e| Error::Other(e.to_string()))?;
+
+    if !pager.in_transaction() {
+        pager.flush()?;
+    }
+
+    catalog.reload(pager)?;
+    Ok(ExecResult { rows_affected: 0 })
+}
+
+fn execute_drop_index(
+    index_name: &str,
+    if_exists: bool,
+    pager: &mut Pager,
+    catalog: &mut Catalog,
+) -> Result<ExecResult> {
+    if !catalog.indexes.contains_key(&index_name.to_lowercase()) {
+        if if_exists {
+            return Ok(ExecResult { rows_affected: 0 });
+        }
+        return Err(Error::Other(format!("no such index: {index_name}")));
+    }
+
+    delete_schema_entries(pager, index_name).map_err(|e| Error::Other(e.to_string()))?;
+
+    if !pager.in_transaction() {
+        pager.flush()?;
+    }
+
+    catalog.reload(pager)?;
     Ok(ExecResult { rows_affected: 0 })
 }
 

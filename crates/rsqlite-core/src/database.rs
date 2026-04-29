@@ -1903,4 +1903,99 @@ mod tests {
         assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(0));
         assert_eq!(result.rows[0].values[1], crate::types::Value::Text("main".to_string()));
     }
+
+    #[test]
+    fn drop_table() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 'hello')").unwrap();
+
+        let result = db.query("SELECT * FROM t1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+
+        db.execute("DROP TABLE t1").unwrap();
+
+        assert!(db.query("SELECT * FROM t1").is_err());
+    }
+
+    #[test]
+    fn drop_table_if_exists() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("DROP TABLE IF EXISTS nonexistent").unwrap();
+
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        db.execute("DROP TABLE IF EXISTS t1").unwrap();
+
+        assert!(db.query("SELECT * FROM t1").is_err());
+    }
+
+    #[test]
+    fn drop_table_removes_indexes() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_name ON t1(name)").unwrap();
+
+        let idx_list = db.query("PRAGMA index_list('t1')").unwrap();
+        assert_eq!(idx_list.rows.len(), 1);
+
+        db.execute("DROP TABLE t1").unwrap();
+
+        let tables = db.query("PRAGMA table_list").unwrap();
+        assert!(tables.rows.iter().all(|r| r.values[1] != crate::types::Value::Text("t1".to_string())));
+    }
+
+    #[test]
+    fn drop_index() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_name ON t1(name)").unwrap();
+
+        let idx_list = db.query("PRAGMA index_list('t1')").unwrap();
+        assert_eq!(idx_list.rows.len(), 1);
+
+        db.execute("DROP INDEX idx_name").unwrap();
+
+        let idx_list = db.query("PRAGMA index_list('t1')").unwrap();
+        assert_eq!(idx_list.rows.len(), 0);
+    }
+
+    #[test]
+    fn drop_index_if_exists() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("DROP INDEX IF EXISTS nonexistent").unwrap();
+    }
+
+    #[test]
+    fn drop_table_then_recreate() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 'first')").unwrap();
+        db.execute("DROP TABLE t1").unwrap();
+
+        db.execute("CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT, extra INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 'second', 42)")
+            .unwrap();
+
+        let result = db.query("SELECT * FROM t1").unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.columns.len(), 3);
+    }
 }

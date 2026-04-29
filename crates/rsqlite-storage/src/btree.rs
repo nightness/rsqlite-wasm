@@ -1573,6 +1573,38 @@ pub fn btree_delete(pager: &mut Pager, root_page: u32, rowid: i64) -> Result<()>
     Ok(())
 }
 
+/// Delete all sqlite_schema entries where the name (column index 1) or
+/// tbl_name (column index 2) matches the given name.
+pub fn delete_schema_entries(pager: &mut Pager, name: &str) -> Result<()> {
+    let mut cursor = BTreeCursor::new(pager, 1);
+    let mut rowids_to_delete = Vec::new();
+    let mut has_row = cursor.first()?;
+    while has_row {
+        let current = cursor.current()?;
+        let matches = current.record.values.get(1).is_some_and(|v| {
+            if let Value::Text(s) = v {
+                s.eq_ignore_ascii_case(name)
+            } else {
+                false
+            }
+        }) || current.record.values.get(2).is_some_and(|v| {
+            if let Value::Text(s) = v {
+                s.eq_ignore_ascii_case(name)
+            } else {
+                false
+            }
+        });
+        if matches {
+            rowids_to_delete.push(current.rowid);
+        }
+        has_row = cursor.next()?;
+    }
+    for rowid in rowids_to_delete {
+        btree_delete(pager, 1, rowid)?;
+    }
+    Ok(())
+}
+
 /// Insert a row into the sqlite_schema table (page 1).
 pub fn insert_schema_entry(
     pager: &mut Pager,

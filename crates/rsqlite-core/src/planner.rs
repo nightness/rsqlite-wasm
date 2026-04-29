@@ -120,6 +120,14 @@ pub enum Plan {
     Insert(InsertPlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
+    DropTable {
+        table_name: String,
+        if_exists: bool,
+    },
+    DropIndex {
+        index_name: String,
+        if_exists: bool,
+    },
     Pragma {
         name: String,
         argument: Option<String>,
@@ -225,6 +233,28 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
             ..
         } => plan_update(table, assignments, selection.as_ref(), catalog),
         Statement::Delete(delete) => plan_delete(delete, catalog),
+        Statement::Drop {
+            object_type,
+            if_exists,
+            names,
+            ..
+        } => {
+            let name = names
+                .first()
+                .ok_or_else(|| Error::Other("DROP requires a name".to_string()))?
+                .to_string();
+            match object_type {
+                ast::ObjectType::Table => Ok(Plan::DropTable {
+                    table_name: name,
+                    if_exists: *if_exists,
+                }),
+                ast::ObjectType::Index => Ok(Plan::DropIndex {
+                    index_name: name,
+                    if_exists: *if_exists,
+                }),
+                other => Err(Error::Other(format!("unsupported DROP {other}"))),
+            }
+        }
         Statement::Pragma { name, value, .. } => {
             let pragma_name = name.to_string().to_lowercase();
             let argument = value.as_ref().map(|v| match v {
