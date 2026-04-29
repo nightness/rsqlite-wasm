@@ -55,6 +55,7 @@ pub struct TableDef {
     pub columns: Vec<ColumnDef>,
     pub root_page: u32,
     pub sql: Option<String>,
+    pub check_constraints: Vec<String>,
 }
 
 impl TableDef {
@@ -155,6 +156,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 columns: vec![],
                 root_page: entry.rootpage,
                 sql: Some(sql.clone()),
+                check_constraints: vec![],
             }));
         }
     };
@@ -224,11 +226,26 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
         // If no explicit PK, SQLite has an implicit rowid
         let _ = has_pk_in_columns;
 
+        let mut check_constraints = Vec::new();
+        for col in &ct.columns {
+            for opt in &col.options {
+                if let ColumnOption::Check(expr) = &opt.option {
+                    check_constraints.push(expr.to_string());
+                }
+            }
+        }
+        for constraint in &ct.constraints {
+            if let ast::TableConstraint::Check { expr, .. } = constraint {
+                check_constraints.push(expr.to_string());
+            }
+        }
+
         Ok(Some(TableDef {
             name: entry.name.clone(),
             columns,
             root_page: entry.rootpage,
             sql: Some(sql.clone()),
+            check_constraints,
         }))
     } else {
         Ok(None)

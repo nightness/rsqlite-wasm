@@ -4107,3 +4107,62 @@
         let r = db.query("SELECT email FROM t").unwrap();
         assert_eq!(r.rows[0].values[0], crate::types::Value::Text("alice@test.com".into()));
     }
+
+    // ───────────────────── CHECK constraint tests ─────────────────────
+
+    #[test]
+    fn check_constraint_insert_violation() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK(age >= 0))").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 25)").unwrap();
+        let r = db.execute("INSERT INTO t VALUES (2, -5)");
+        assert!(r.is_err());
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("CHECK"), "Expected CHECK error, got: {err}");
+    }
+
+    #[test]
+    fn check_constraint_insert_valid() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK(age >= 0))").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 0)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 100)").unwrap();
+        let r = db.query("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(2));
+    }
+
+    #[test]
+    fn check_constraint_update_violation() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK(age >= 0))").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 25)").unwrap();
+        let r = db.execute("UPDATE t SET age = -1 WHERE id = 1");
+        assert!(r.is_err());
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("CHECK"), "Expected CHECK error, got: {err}");
+    }
+
+    #[test]
+    fn check_constraint_null_passes() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER CHECK(age >= 0))").unwrap();
+        db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+        let r = db.query("SELECT age FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Null);
+    }
+
+    #[test]
+    fn check_constraint_table_level() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, lo INTEGER, hi INTEGER, CHECK(lo <= hi))").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10, 20)").unwrap();
+        let r = db.execute("INSERT INTO t VALUES (2, 30, 20)");
+        assert!(r.is_err());
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("CHECK"), "Expected CHECK error, got: {err}");
+    }

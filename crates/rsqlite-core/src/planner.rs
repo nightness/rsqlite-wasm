@@ -18,7 +18,7 @@ mod expr;
 pub use expr::*;
 use expr::{
     collect_aggregates, collect_window_functions, contains_aggregate, contains_window_function,
-    plan_expr, plan_limit_expr, plan_order_expr, plan_select_items,
+    plan_limit_expr, plan_order_expr, plan_select_items,
 };
 
 #[derive(Debug, Clone)]

@@ -934,6 +934,7 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
 
             check_not_null_constraints(&values, &plan.table_columns, &plan.table_name)?;
             check_unique_constraints(&values, &plan.table_columns, &plan.table_name, pager, current_root, None)?;
+            check_check_constraints(&values, &plan.table_columns, &plan.table_name, pager, catalog)?;
             let record = Record { values: values.clone() };
             current_root = btree_insert(pager, current_root, rowid, &record)?;
             for (idx_root, idx_col_indices) in &table_indexes {
@@ -1042,6 +1043,7 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
 
         check_not_null_constraints(&values, &plan.table_columns, &plan.table_name)?;
         check_unique_constraints(&values, &plan.table_columns, &plan.table_name, pager, current_root, None)?;
+        check_check_constraints(&values, &plan.table_columns, &plan.table_name, pager, catalog)?;
         let record = Record {
             values: values.clone(),
         };
@@ -1064,6 +1066,58 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
     set_last_insert_rowid(last_rowid);
     set_changes(rows_affected as i64);
     Ok(ExecResult { rows_affected })
+}
+
+fn check_check_constraints(
+    values: &[Value],
+    columns: &[ColumnRef],
+    table_name: &str,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<()> {
+    let table_def = match catalog.get_table(table_name) {
+        Some(td) => td,
+        None => return Ok(()),
+    };
+    if table_def.check_constraints.is_empty() {
+        return Ok(());
+    }
+
+    let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let row = Row { values: values.to_vec() };
+
+    for check_sql in &table_def.check_constraints {
+        let parsed = rsqlite_parser::parse::parse_sql(&format!("SELECT {check_sql}"));
+        let expr = match parsed {
+            Ok(stmts) => {
+                if let Some(sqlparser::ast::Statement::Query(q)) = stmts.into_iter().next() {
+                    if let sqlparser::ast::SetExpr::Select(sel) = *q.body {
+                        if let Some(item) = sel.projection.into_iter().next() {
+                            if let sqlparser::ast::SelectItem::UnnamedExpr(e) = item {
+                                Some(e)
+                            } else { None }
+                        } else { None }
+                    } else { None }
+                } else { None }
+            }
+            Err(_) => None,
+        };
+        let expr = match expr {
+            Some(e) => e,
+            None => continue,
+        };
+        let plan_expr = match crate::planner::plan_expr(&expr, columns, catalog) {
+            Ok(pe) => pe,
+            Err(_) => continue,
+        };
+        let val = eval_expr(&plan_expr, &row, &col_names, pager, catalog)?;
+        if !is_truthy(&val) && !matches!(val, Value::Null) {
+            return Err(Error::Other(format!(
+                "CHECK constraint failed: {table_name}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn check_not_null_constraints(values: &[Value], columns: &[ColumnRef], table_name: &str) -> Result<()> {
@@ -1453,6 +1507,7 @@ fn execute_update(plan: &UpdatePlan, pager: &mut Pager, catalog: &Catalog) -> Re
             }
             check_not_null_constraints(&new_values, &plan.table_columns, &plan.table_name)?;
             check_unique_constraints(&new_values, &plan.table_columns, &plan.table_name, pager, plan.root_page, Some(btree_row.rowid))?;
+            check_check_constraints(&new_values, &plan.table_columns, &plan.table_name, pager, catalog)?;
             to_update.push((btree_row.rowid, new_values));
         }
     }

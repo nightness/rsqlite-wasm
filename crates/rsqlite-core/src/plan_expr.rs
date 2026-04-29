@@ -185,7 +185,7 @@ pub(super) fn plan_select_items(
     Ok(outputs)
 }
 
-pub(super) fn plan_expr(expr: &Expr, columns: &[ColumnRef], catalog: &Catalog) -> Result<PlanExpr> {
+pub fn plan_expr(expr: &Expr, columns: &[ColumnRef], catalog: &Catalog) -> Result<PlanExpr> {
     match expr {
         Expr::Identifier(ident) => {
             let name = &ident.value;
