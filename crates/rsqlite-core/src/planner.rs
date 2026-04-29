@@ -100,6 +100,16 @@ pub struct SortKey {
 #[derive(Debug, Clone)]
 pub enum Plan {
     SingleRow,
+    RecursiveCte {
+        name: String,
+        column_names: Vec<String>,
+        anchor: Box<Plan>,
+        recursive: Box<Plan>,
+    },
+    RecursiveCteRef {
+        name: String,
+        columns: Vec<ColumnRef>,
+    },
     Union {
         left: Box<Plan>,
         right: Box<Plan>,
@@ -529,12 +539,111 @@ fn plan_set_expr(set_expr: &SetExpr, catalog: &Catalog, ctes: &CteMap) -> Result
     }
 }
 
+fn body_references_name(body: &SetExpr, name: &str) -> bool {
+    match body {
+        SetExpr::Select(s) => {
+            for item in &s.from {
+                if let ast::TableFactor::Table { name: tname, .. } = &item.relation {
+                    if tname.to_string().to_lowercase() == name {
+                        return true;
+                    }
+                }
+                for join in &item.joins {
+                    if let ast::TableFactor::Table { name: tname, .. } = &join.relation {
+                        if tname.to_string().to_lowercase() == name {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        SetExpr::SetOperation { left, right, .. } => {
+            body_references_name(left, name) || body_references_name(right, name)
+        }
+        _ => false,
+    }
+}
+
+fn is_recursive_cte(cte: &ast::Cte, name: &str) -> bool {
+    body_references_name(cte.query.body.as_ref(), name)
+}
+
+fn plan_recursive_cte(
+    cte: &ast::Cte,
+    name: &str,
+    column_names: &[String],
+    catalog: &Catalog,
+    parent_ctes: &CteMap,
+) -> Result<(Plan, Plan)> {
+    match cte.query.body.as_ref() {
+        SetExpr::SetOperation { left, right, op, .. } if *op == ast::SetOperator::Union => {
+            let (anchor_body, recursive_body) = if body_references_name(right, name) {
+                (left.as_ref(), right.as_ref())
+            } else if body_references_name(left, name) {
+                (right.as_ref(), left.as_ref())
+            } else {
+                return Err(Error::Other("recursive CTE does not reference itself".into()));
+            };
+
+            let anchor_plan = plan_set_expr(anchor_body, catalog, parent_ctes)?;
+
+            let ref_columns: Vec<ColumnRef> = column_names.iter().enumerate().map(|(i, cn)| {
+                ColumnRef {
+                    name: cn.clone(),
+                    column_index: i,
+                    is_rowid_alias: false,
+                    table: Some(name.to_string()),
+                    nullable: true,
+                    is_primary_key: false,
+                    is_unique: false,
+                }
+            }).collect();
+
+            let mut recursive_ctes = parent_ctes.clone();
+            recursive_ctes.insert(name.to_string(), CteDef {
+                plan: Plan::RecursiveCteRef {
+                    name: name.to_string(),
+                    columns: ref_columns,
+                },
+                output_columns: column_names.to_vec(),
+            });
+
+            let recursive_plan = plan_set_expr(recursive_body, catalog, &recursive_ctes)?;
+
+            Ok((anchor_plan, recursive_plan))
+        }
+        _ => Err(Error::Other(
+            "recursive CTE must use UNION or UNION ALL".into(),
+        )),
+    }
+}
+
 fn plan_select(query: &ast::Query, catalog: &Catalog, parent_ctes: &CteMap) -> Result<Plan> {
     let mut ctes = parent_ctes.clone();
 
     if let Some(with) = &query.with {
         for cte in &with.cte_tables {
             let name = cte.alias.name.value.to_lowercase();
+
+            if with.recursive && is_recursive_cte(cte, &name) {
+                let column_names: Vec<String> = cte.alias.columns.iter().map(|c| c.name.value.clone()).collect();
+                let (anchor_plan, recursive_plan) = plan_recursive_cte(cte, &name, &column_names, catalog, &ctes)?;
+                let rcte_plan = Plan::RecursiveCte {
+                    name: name.clone(),
+                    column_names: column_names.clone(),
+                    anchor: Box::new(anchor_plan),
+                    recursive: Box::new(recursive_plan),
+                };
+                let output_columns = if column_names.is_empty() {
+                    extract_plan_output_names(&rcte_plan, &[])
+                } else {
+                    column_names.clone()
+                };
+                ctes.insert(name, CteDef { plan: rcte_plan, output_columns });
+                continue;
+            }
+
             let mut cte_plan = plan_select(&cte.query, catalog, &ctes)?;
             let output_columns = if cte.alias.columns.is_empty() {
                 extract_plan_output_names(&cte_plan, &[])

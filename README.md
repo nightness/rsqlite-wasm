@@ -12,7 +12,7 @@ Databases created by rsqlite-wasm are **file-format compatible** with SQLite —
 - **Web Worker architecture** — all I/O runs off the main thread
 - **Vector search** — built-in `vec_distance_cosine`, `vec_distance_l2`, and `vec_distance_dot` functions for embedding similarity search
 - **Small binary** — ~1.6 MB WASM with LTO + `opt-level=z`
-- **320+ tests** — comprehensive coverage across all crates
+- **324+ tests** — comprehensive coverage across all crates
 
 ## SQL Support
 
@@ -23,7 +23,7 @@ Databases created by rsqlite-wasm are **file-format compatible** with SQLite —
 - **Aggregates:** COUNT, SUM, AVG, MIN, MAX, TOTAL, GROUP_CONCAT (with DISTINCT, custom separator)
 - **Subqueries:** IN, EXISTS, scalar subqueries
 - **Set operations:** UNION, UNION ALL
-- **CTEs:** WITH ... AS (multiple, column renaming)
+- **CTEs:** WITH ... AS (multiple, column renaming); WITH RECURSIVE
 - **Views:** CREATE VIEW, DROP VIEW, SELECT from views
 - **Expressions:** CASE, CAST, LIKE, GLOB, BETWEEN, IN, string concatenation (`||`)
 - **DDL:** CREATE TABLE, CREATE INDEX, DROP TABLE/INDEX/VIEW, ALTER TABLE (ADD COLUMN, RENAME)
@@ -43,7 +43,6 @@ Databases created by rsqlite-wasm are **file-format compatible** with SQLite —
 
 ### Not yet supported
 
-- Recursive CTEs (WITH RECURSIVE)
 - Triggers
 - WAL mode
 - VACUUM, ATTACH DATABASE

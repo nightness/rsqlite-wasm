@@ -26,7 +26,10 @@ thread_local! {
     static LAST_CHANGES: RefCell<i64> = RefCell::new(0);
     static TOTAL_CHANGES_COUNT: RefCell<i64> = RefCell::new(0);
     static FOREIGN_KEYS_ENABLED: RefCell<bool> = RefCell::new(false);
+    static RECURSIVE_CTE_WORKING: RefCell<HashMap<String, QueryResult>> = RefCell::new(HashMap::new());
 }
+
+use std::collections::HashMap;
 
 pub fn set_params(params: Vec<Value>) {
     BOUND_PARAMS.with(|p| *p.borrow_mut() = params);
@@ -97,6 +100,48 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             columns: vec![],
             rows: vec![Row { values: vec![] }],
         }),
+        Plan::RecursiveCte { name, column_names, anchor, recursive } => {
+            let anchor_result = execute(anchor, pager, catalog)?;
+            let columns = if !column_names.is_empty() {
+                column_names.clone()
+            } else {
+                anchor_result.columns.clone()
+            };
+            let mut all_rows = anchor_result.rows.clone();
+            let mut working_rows = anchor_result.rows;
+
+            const MAX_ITERATIONS: usize = 1000;
+            for _ in 0..MAX_ITERATIONS {
+                if working_rows.is_empty() {
+                    break;
+                }
+                RECURSIVE_CTE_WORKING.with(|w| {
+                    w.borrow_mut().insert(name.clone(), QueryResult {
+                        columns: columns.clone(),
+                        rows: working_rows.clone(),
+                    });
+                });
+                let new_result = execute(recursive, pager, catalog)?;
+                RECURSIVE_CTE_WORKING.with(|w| {
+                    w.borrow_mut().remove(name);
+                });
+                if new_result.rows.is_empty() {
+                    break;
+                }
+                all_rows.extend(new_result.rows.clone());
+                working_rows = new_result.rows;
+            }
+            Ok(QueryResult { columns, rows: all_rows })
+        }
+        Plan::RecursiveCteRef { name, .. } => {
+            let result = RECURSIVE_CTE_WORKING.with(|w| {
+                w.borrow().get(name).cloned()
+            });
+            match result {
+                Some(qr) => Ok(qr),
+                None => Err(Error::Other(format!("recursive CTE '{}' not in scope", name))),
+            }
+        }
         Plan::Union { left, right, all } => {
             let left_result = execute(left, pager, catalog)?;
             let right_result = execute(right, pager, catalog)?;

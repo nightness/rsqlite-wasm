@@ -4479,3 +4479,84 @@
         let r = db.query("SELECT * FROM child").unwrap();
         assert_eq!(r.rows.len(), 1);
     }
+
+    // ── Recursive CTE tests ──
+
+    #[test]
+    fn recursive_cte_counting() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        let r = db.query("
+            WITH RECURSIVE cnt(x) AS (
+                SELECT 1
+                UNION ALL
+                SELECT x + 1 FROM cnt WHERE x < 5
+            )
+            SELECT x FROM cnt
+        ").unwrap();
+        assert_eq!(r.rows.len(), 5);
+        assert_eq!(r.rows[0].values[0], Value::Integer(1));
+        assert_eq!(r.rows[4].values[0], Value::Integer(5));
+    }
+
+    #[test]
+    fn recursive_cte_hierarchy() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER)").unwrap();
+        db.execute("INSERT INTO emp VALUES (1, 'CEO', NULL)").unwrap();
+        db.execute("INSERT INTO emp VALUES (2, 'VP', 1)").unwrap();
+        db.execute("INSERT INTO emp VALUES (3, 'Director', 2)").unwrap();
+        db.execute("INSERT INTO emp VALUES (4, 'Manager', 3)").unwrap();
+
+        let r = db.query("
+            WITH RECURSIVE chain(id, name, level) AS (
+                SELECT id, name, 0 FROM emp WHERE id = 1
+                UNION ALL
+                SELECT e.id, e.name, c.level + 1
+                FROM emp e JOIN chain c ON e.manager_id = c.id
+            )
+            SELECT name, level FROM chain ORDER BY level
+        ").unwrap();
+        assert_eq!(r.rows.len(), 4);
+        assert_eq!(r.rows[0].values[0], Value::Text("CEO".into()));
+        assert_eq!(r.rows[0].values[1], Value::Integer(0));
+        assert_eq!(r.rows[3].values[0], Value::Text("Manager".into()));
+        assert_eq!(r.rows[3].values[1], Value::Integer(3));
+    }
+
+    #[test]
+    fn recursive_cte_fibonacci() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        let r = db.query("
+            WITH RECURSIVE fib(a, b) AS (
+                SELECT 0, 1
+                UNION ALL
+                SELECT b, a + b FROM fib WHERE b < 100
+            )
+            SELECT a FROM fib
+        ").unwrap();
+        assert_eq!(r.rows[0].values[0], Value::Integer(0));
+        assert_eq!(r.rows[1].values[0], Value::Integer(1));
+        assert_eq!(r.rows[2].values[0], Value::Integer(1));
+        assert_eq!(r.rows[3].values[0], Value::Integer(2));
+        assert_eq!(r.rows[4].values[0], Value::Integer(3));
+        assert_eq!(r.rows[5].values[0], Value::Integer(5));
+    }
+
+    #[test]
+    fn recursive_cte_with_limit() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        let r = db.query("
+            WITH RECURSIVE cnt(x) AS (
+                SELECT 1
+                UNION ALL
+                SELECT x + 1 FROM cnt WHERE x < 100
+            )
+            SELECT x FROM cnt LIMIT 10
+        ").unwrap();
+        assert_eq!(r.rows.len(), 10);
+        assert_eq!(r.rows[9].values[0], Value::Integer(10));
+    }
