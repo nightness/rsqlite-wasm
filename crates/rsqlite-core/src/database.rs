@@ -1617,4 +1617,128 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    #[test]
+    fn index_scan_basic() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_name ON users(name)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice', 30)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob', 25)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie', 35)")
+            .unwrap();
+        db.execute("INSERT INTO users VALUES (4, 'Alice', 28)")
+            .unwrap();
+
+        let result = db.query("SELECT id, name, age FROM users WHERE name = 'Alice'").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(
+            result.rows[0].values[1],
+            crate::types::Value::Text("Alice".to_string())
+        );
+        assert_eq!(
+            result.rows[1].values[1],
+            crate::types::Value::Text("Alice".to_string())
+        );
+    }
+
+    #[test]
+    fn index_scan_no_results() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_code ON items(code)")
+            .unwrap();
+
+        db.execute("INSERT INTO items VALUES (1, 'A001')").unwrap();
+        db.execute("INSERT INTO items VALUES (2, 'B002')").unwrap();
+
+        let result = db.query("SELECT * FROM items WHERE code = 'C003'").unwrap();
+        assert_eq!(result.rows.len(), 0);
+    }
+
+    #[test]
+    fn index_scan_with_additional_filter() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, category TEXT, price INTEGER)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_cat ON products(category)")
+            .unwrap();
+
+        db.execute("INSERT INTO products VALUES (1, 'Electronics', 100)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (2, 'Electronics', 200)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (3, 'Books', 15)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (4, 'Electronics', 50)")
+            .unwrap();
+
+        let result = db
+            .query("SELECT * FROM products WHERE category = 'Electronics' AND price > 75")
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn index_scan_integer_key() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE scores (id INTEGER PRIMARY KEY, player TEXT, level INTEGER)")
+            .unwrap();
+        db.execute("CREATE INDEX idx_level ON scores(level)")
+            .unwrap();
+
+        db.execute("INSERT INTO scores VALUES (1, 'Alice', 5)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES (2, 'Bob', 3)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES (3, 'Charlie', 5)")
+            .unwrap();
+        db.execute("INSERT INTO scores VALUES (4, 'Dave', 1)")
+            .unwrap();
+
+        let result = db.query("SELECT player FROM scores WHERE level = 5").unwrap();
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn index_scan_returns_same_as_table_scan() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+
+        for i in 1..=20 {
+            db.execute(&format!(
+                "INSERT INTO t VALUES ({i}, '{}')",
+                if i % 3 == 0 { "match" } else { "other" }
+            ))
+            .unwrap();
+        }
+
+        let before_index = db.query("SELECT id FROM t WHERE val = 'match'").unwrap();
+
+        db.execute("CREATE INDEX idx_val ON t(val)").unwrap();
+
+        let after_index = db.query("SELECT id FROM t WHERE val = 'match'").unwrap();
+
+        assert_eq!(before_index.rows.len(), after_index.rows.len());
+        let before_ids: Vec<_> = before_index.rows.iter().map(|r| &r.values[0]).collect();
+        let after_ids: Vec<_> = after_index.rows.iter().map(|r| &r.values[0]).collect();
+        assert_eq!(before_ids, after_ids);
+    }
 }

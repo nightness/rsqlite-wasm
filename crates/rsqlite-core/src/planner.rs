@@ -75,6 +75,14 @@ pub enum Plan {
         root_page: u32,
         columns: Vec<ColumnRef>,
     },
+    IndexScan {
+        table: String,
+        table_root_page: u32,
+        index_root_page: u32,
+        columns: Vec<ColumnRef>,
+        index_columns: Vec<String>,
+        lookup_values: Vec<PlanExpr>,
+    },
     Filter {
         input: Box<Plan>,
         predicate: PlanExpr,
@@ -365,13 +373,20 @@ fn plan_select(query: &ast::Query, catalog: &Catalog) -> Result<Plan> {
         }
     }
 
-    // WHERE clause -> Filter
+    // WHERE clause -> Filter (with index optimization)
     if let Some(selection) = &select.selection {
         let predicate = plan_expr(selection, &all_columns)?;
-        plan = Plan::Filter {
-            input: Box::new(plan),
-            predicate,
-        };
+
+        if let Some(index_plan) =
+            try_index_scan(&plan, &predicate, &all_columns, catalog)
+        {
+            plan = index_plan;
+        } else {
+            plan = Plan::Filter {
+                input: Box::new(plan),
+                predicate,
+            };
+        }
     }
 
     // Check for GROUP BY and aggregate functions
@@ -914,6 +929,162 @@ fn plan_create_table(ct: &ast::CreateTable) -> Result<Plan> {
         columns,
         if_not_exists: ct.if_not_exists,
     }))
+}
+
+fn try_index_scan(
+    current_plan: &Plan,
+    predicate: &PlanExpr,
+    _all_columns: &[ColumnRef],
+    catalog: &Catalog,
+) -> Option<Plan> {
+    let (table_name, table_root, columns) = match current_plan {
+        Plan::Scan {
+            table,
+            root_page,
+            columns,
+        } => (table, *root_page, columns),
+        _ => return None,
+    };
+
+    let eq_parts = extract_equality_parts(predicate)?;
+
+    for idx_def in catalog.indexes.values() {
+        if !idx_def.table_name.eq_ignore_ascii_case(table_name) {
+            continue;
+        }
+        if idx_def.columns.is_empty() {
+            continue;
+        }
+
+        if eq_parts.len() >= idx_def.columns.len() {
+            let mut lookup_values = Vec::new();
+            let mut all_matched = true;
+
+            for idx_col in &idx_def.columns {
+                let found = eq_parts.iter().find(|(col_name, _)| {
+                    col_name.eq_ignore_ascii_case(idx_col)
+                });
+                match found {
+                    Some((_, val_expr)) => lookup_values.push(val_expr.clone()),
+                    None => {
+                        all_matched = false;
+                        break;
+                    }
+                }
+            }
+
+            if all_matched {
+                let remaining_predicate = build_remaining_predicate(predicate, &idx_def.columns);
+
+                let index_scan = Plan::IndexScan {
+                    table: table_name.clone(),
+                    table_root_page: table_root,
+                    index_root_page: idx_def.root_page,
+                    columns: columns.clone(),
+                    index_columns: idx_def.columns.clone(),
+                    lookup_values,
+                };
+
+                return if let Some(remaining) = remaining_predicate {
+                    Some(Plan::Filter {
+                        input: Box::new(index_scan),
+                        predicate: remaining,
+                    })
+                } else {
+                    Some(index_scan)
+                };
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_equality_parts(predicate: &PlanExpr) -> Option<Vec<(String, PlanExpr)>> {
+    let mut parts = Vec::new();
+    collect_and_equalities(predicate, &mut parts);
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts)
+    }
+}
+
+fn collect_and_equalities(expr: &PlanExpr, out: &mut Vec<(String, PlanExpr)>) {
+    match expr {
+        PlanExpr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            collect_and_equalities(left, out);
+            collect_and_equalities(right, out);
+        }
+        PlanExpr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            if let PlanExpr::Column(col) = left.as_ref() {
+                if !matches!(right.as_ref(), PlanExpr::Column(_)) {
+                    out.push((col.name.clone(), *right.clone()));
+                }
+            } else if let PlanExpr::Column(col) = right.as_ref() {
+                if !matches!(left.as_ref(), PlanExpr::Column(_)) {
+                    out.push((col.name.clone(), *left.clone()));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn build_remaining_predicate(predicate: &PlanExpr, index_columns: &[String]) -> Option<PlanExpr> {
+    match predicate {
+        PlanExpr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            let left_remaining = build_remaining_predicate(left, index_columns);
+            let right_remaining = build_remaining_predicate(right, index_columns);
+            match (left_remaining, right_remaining) {
+                (Some(l), Some(r)) => Some(PlanExpr::BinaryOp {
+                    left: Box::new(l),
+                    op: BinOp::And,
+                    right: Box::new(r),
+                }),
+                (Some(l), None) => Some(l),
+                (None, Some(r)) => Some(r),
+                (None, None) => None,
+            }
+        }
+        PlanExpr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            let is_index_eq = if let PlanExpr::Column(col) = left.as_ref() {
+                index_columns
+                    .iter()
+                    .any(|ic| ic.eq_ignore_ascii_case(&col.name))
+                    && !matches!(right.as_ref(), PlanExpr::Column(_))
+            } else if let PlanExpr::Column(col) = right.as_ref() {
+                index_columns
+                    .iter()
+                    .any(|ic| ic.eq_ignore_ascii_case(&col.name))
+                    && !matches!(left.as_ref(), PlanExpr::Column(_))
+            } else {
+                false
+            };
+            if is_index_eq {
+                None
+            } else {
+                Some(predicate.clone())
+            }
+        }
+        _ => Some(predicate.clone()),
+    }
 }
 
 fn plan_create_index(ci: &ast::CreateIndex) -> Result<Plan> {

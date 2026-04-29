@@ -1,6 +1,6 @@
 use rsqlite_storage::btree::{
     btree_create_index, btree_create_table, btree_delete, btree_index_delete, btree_index_insert,
-    btree_insert, btree_max_rowid, insert_schema_entry, BTreeCursor, CursorRow,
+    btree_insert, btree_max_rowid, insert_schema_entry, BTreeCursor, CursorRow, IndexCursor,
 };
 use rsqlite_storage::codec::{Record, Value};
 use rsqlite_storage::pager::Pager;
@@ -41,6 +41,21 @@ pub fn execute(plan: &Plan, pager: &mut Pager) -> Result<QueryResult> {
             columns,
             ..
         } => execute_scan(*root_page, columns, pager),
+        Plan::IndexScan {
+            table_root_page,
+            index_root_page,
+            columns,
+            index_columns,
+            lookup_values,
+            ..
+        } => execute_index_scan(
+            *table_root_page,
+            *index_root_page,
+            columns,
+            index_columns,
+            lookup_values,
+            pager,
+        ),
         Plan::Sort { input, keys } => {
             let mut inner = execute(input, pager)?;
             let columns = inner.columns.clone();
@@ -712,6 +727,98 @@ fn execute_scan(
         columns: column_names,
         rows,
     })
+}
+
+fn execute_index_scan(
+    table_root_page: u32,
+    index_root_page: u32,
+    columns: &[ColumnRef],
+    index_columns: &[String],
+    lookup_values: &[PlanExpr],
+    pager: &mut Pager,
+) -> Result<QueryResult> {
+    let column_names: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            if let Some(t) = &c.table {
+                format!("{}.{}", t, c.name)
+            } else {
+                c.name.clone()
+            }
+        })
+        .collect();
+
+    let eval_values: Vec<Value> = lookup_values
+        .iter()
+        .map(|expr| eval_expr(expr, &Row { values: vec![] }, &[]))
+        .collect::<Result<_>>()?;
+
+    let mut index_cursor = IndexCursor::new(pager, index_root_page);
+    let index_entries = index_cursor.collect_all().map_err(|e| Error::Other(e.to_string()))?;
+
+    let mut matching_rowids = Vec::new();
+    for entry in &index_entries {
+        if entry.values.len() < index_columns.len() + 1 {
+            continue;
+        }
+        let mut matches = true;
+        for (i, lookup_val) in eval_values.iter().enumerate() {
+            let entry_val = &entry.values[i];
+            if !values_equal(entry_val, lookup_val) {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            if let Some(Value::Integer(rowid)) = entry.values.last() {
+                matching_rowids.push(*rowid);
+            }
+        }
+    }
+
+    let mut table_cursor = BTreeCursor::new(pager, table_root_page);
+    let all_rows = table_cursor.collect_all().map_err(|e| Error::Other(e.to_string()))?;
+
+    let mut rows = Vec::with_capacity(matching_rowids.len());
+    for rowid in &matching_rowids {
+        for btree_row in &all_rows {
+            if btree_row.rowid == *rowid {
+                let record_values = &btree_row.record.values;
+                let mut row_values = Vec::with_capacity(columns.len());
+                for col in columns {
+                    if col.is_rowid_alias {
+                        row_values.push(Value::Integer(btree_row.rowid));
+                    } else {
+                        let val = record_values
+                            .get(col.column_index)
+                            .cloned()
+                            .unwrap_or(Value::Null);
+                        row_values.push(val);
+                    }
+                }
+                rows.push(Row { values: row_values });
+                break;
+            }
+        }
+    }
+
+    Ok(QueryResult {
+        columns: column_names,
+        rows,
+    })
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, Value::Null) => false,
+        (Value::Integer(x), Value::Integer(y)) => x == y,
+        (Value::Real(x), Value::Real(y)) => x == y,
+        (Value::Integer(x), Value::Real(y)) => (*x as f64) == *y,
+        (Value::Real(x), Value::Integer(y)) => *x == (*y as f64),
+        (Value::Text(x), Value::Text(y)) => x == y,
+        (Value::Blob(x), Value::Blob(y)) => x == y,
+        _ => false,
+    }
 }
 
 fn execute_project(
