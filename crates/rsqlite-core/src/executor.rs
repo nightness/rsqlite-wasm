@@ -25,6 +25,7 @@ thread_local! {
     static LAST_INSERT_ROWID: RefCell<i64> = RefCell::new(0);
     static LAST_CHANGES: RefCell<i64> = RefCell::new(0);
     static TOTAL_CHANGES_COUNT: RefCell<i64> = RefCell::new(0);
+    static FOREIGN_KEYS_ENABLED: RefCell<bool> = RefCell::new(false);
 }
 
 pub fn set_params(params: Vec<Value>) {
@@ -63,6 +64,14 @@ fn get_changes() -> i64 {
 
 fn get_total_changes() -> i64 {
     TOTAL_CHANGES_COUNT.with(|t| *t.borrow())
+}
+
+pub fn set_foreign_keys_enabled(enabled: bool) {
+    FOREIGN_KEYS_ENABLED.with(|f| *f.borrow_mut() = enabled);
+}
+
+fn foreign_keys_enabled() -> bool {
+    FOREIGN_KEYS_ENABLED.with(|f| *f.borrow())
 }
 
 pub fn get_last_insert_rowid_pub() -> i64 {
@@ -463,6 +472,26 @@ pub fn execute_pragma(
                 ],
             }],
         }),
+        "foreign_keys" | "foreign_key_list" if name == "foreign_keys" => {
+            match argument {
+                Some(val) => {
+                    let enabled = matches!(val.trim().trim_matches('\''), "1" | "ON" | "on" | "yes" | "true");
+                    set_foreign_keys_enabled(enabled);
+                    Ok(QueryResult {
+                        columns: vec!["foreign_keys".to_string()],
+                        rows: vec![Row {
+                            values: vec![Value::Integer(if enabled { 1 } else { 0 })],
+                        }],
+                    })
+                }
+                None => Ok(QueryResult {
+                    columns: vec!["foreign_keys".to_string()],
+                    rows: vec![Row {
+                        values: vec![Value::Integer(if foreign_keys_enabled() { 1 } else { 0 })],
+                    }],
+                }),
+            }
+        }
         _ => Err(Error::Other(format!("unsupported PRAGMA: {name}"))),
     }
 }
@@ -965,6 +994,7 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
             check_not_null_constraints(&values, &plan.table_columns, &plan.table_name)?;
             check_unique_constraints(&values, &plan.table_columns, &plan.table_name, pager, current_root, None)?;
             check_check_constraints(&values, &plan.table_columns, &plan.table_name, pager, catalog)?;
+            check_foreign_key_insert(&values, &plan.table_columns, &plan.table_name, pager, catalog)?;
             let record = Record { values: values.clone() };
             current_root = btree_insert(pager, current_root, rowid, &record)?;
             if rowid > max_rowid_inserted {
@@ -1082,6 +1112,7 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
         check_not_null_constraints(&values, &plan.table_columns, &plan.table_name)?;
         check_unique_constraints(&values, &plan.table_columns, &plan.table_name, pager, current_root, None)?;
         check_check_constraints(&values, &plan.table_columns, &plan.table_name, pager, catalog)?;
+        check_foreign_key_insert(&values, &plan.table_columns, &plan.table_name, pager, catalog)?;
         let record = Record {
             values: values.clone(),
         };
@@ -1296,6 +1327,128 @@ fn check_unique_constraints(
                 if compare(existing, new_val) == 0 {
                     return Err(Error::Other(format!(
                         "UNIQUE constraint failed: {}.{}", table_name, col_name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_foreign_key_insert(
+    values: &[Value],
+    columns: &[ColumnRef],
+    table_name: &str,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<()> {
+    if !foreign_keys_enabled() {
+        return Ok(());
+    }
+    let table_def = match catalog.get_table(table_name) {
+        Some(td) => td,
+        None => return Ok(()),
+    };
+    if table_def.foreign_keys.is_empty() {
+        return Ok(());
+    }
+
+    for fk in &table_def.foreign_keys {
+        let fk_values: Vec<Value> = fk.from_columns.iter().map(|fc| {
+            columns.iter().position(|c| c.name.eq_ignore_ascii_case(fc))
+                .map(|i| values[i].clone())
+                .unwrap_or(Value::Null)
+        }).collect();
+
+        if fk_values.iter().all(|v| matches!(v, Value::Null)) {
+            continue;
+        }
+
+        let parent = match catalog.get_table(&fk.to_table) {
+            Some(t) => t,
+            None => return Err(Error::Other(format!("FOREIGN KEY constraint failed: parent table '{}' not found", fk.to_table))),
+        };
+
+        let parent_col_indices: Vec<usize> = fk.to_columns.iter().map(|tc| {
+            parent.columns.iter().position(|c| c.name.eq_ignore_ascii_case(tc)).unwrap_or(0)
+        }).collect();
+
+        let mut cursor = BTreeCursor::new(pager, parent.root_page);
+        let rows = cursor.collect_all().map_err(|e| Error::Other(e.to_string()))?;
+        let mut found = false;
+        for row in &rows {
+            let match_all = parent_col_indices.iter().zip(fk_values.iter()).all(|(&ci, fk_val)| {
+                let parent_col = &parent.columns[ci];
+                let parent_val = if parent_col.is_rowid_alias {
+                    Value::Integer(row.rowid)
+                } else {
+                    row.record.values.get(ci).cloned().unwrap_or(Value::Null)
+                };
+                values_equal(&parent_val, fk_val)
+            });
+            if match_all {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(Error::Other(format!(
+                "FOREIGN KEY constraint failed: {}.({}) -> {}.({}){}",
+                table_name,
+                fk.from_columns.join(", "),
+                fk.to_table,
+                fk.to_columns.join(", "),
+                fk_values.iter().map(|v| format!(" {v:?}")).collect::<String>(),
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn check_foreign_key_delete(
+    deleted_rowid: i64,
+    deleted_values: &[Value],
+    table_name: &str,
+    table_columns: &[crate::catalog::ColumnDef],
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<()> {
+    if !foreign_keys_enabled() {
+        return Ok(());
+    }
+    for child_table in catalog.all_tables() {
+        for fk in &child_table.foreign_keys {
+            if !fk.to_table.eq_ignore_ascii_case(table_name) {
+                continue;
+            }
+            let parent_col_indices: Vec<usize> = fk.to_columns.iter().map(|tc| {
+                table_columns.iter().position(|c| c.name.eq_ignore_ascii_case(tc)).unwrap_or(0)
+            }).collect();
+
+            let parent_vals: Vec<Value> = parent_col_indices.iter().map(|&ci| {
+                let col = &table_columns[ci];
+                if col.is_rowid_alias {
+                    Value::Integer(deleted_rowid)
+                } else {
+                    deleted_values.get(ci).cloned().unwrap_or(Value::Null)
+                }
+            }).collect();
+
+            let child_col_indices: Vec<usize> = fk.from_columns.iter().map(|fc| {
+                child_table.columns.iter().position(|c| c.name.eq_ignore_ascii_case(fc)).unwrap_or(0)
+            }).collect();
+
+            let mut cursor = BTreeCursor::new(pager, child_table.root_page);
+            let rows = cursor.collect_all().map_err(|e| Error::Other(e.to_string()))?;
+            for row in &rows {
+                let match_all = child_col_indices.iter().zip(parent_vals.iter()).all(|(&ci, pv)| {
+                    let child_val = row.record.values.get(ci).cloned().unwrap_or(Value::Null);
+                    values_equal(&child_val, pv)
+                });
+                if match_all {
+                    return Err(Error::Other(format!(
+                        "FOREIGN KEY constraint failed: cannot delete from '{}' — referenced by '{}'",
+                        table_name, child_table.name
                     )));
                 }
             }
@@ -1639,6 +1792,7 @@ fn execute_update(plan: &UpdatePlan, pager: &mut Pager, catalog: &Catalog) -> Re
             check_not_null_constraints(&new_values, &plan.table_columns, &plan.table_name)?;
             check_unique_constraints(&new_values, &plan.table_columns, &plan.table_name, pager, plan.root_page, Some(btree_row.rowid))?;
             check_check_constraints(&new_values, &plan.table_columns, &plan.table_name, pager, catalog)?;
+            check_foreign_key_insert(&new_values, &plan.table_columns, &plan.table_name, pager, catalog)?;
             to_update.push((btree_row.rowid, new_values));
         }
     }
@@ -1723,6 +1877,14 @@ fn execute_delete(plan: &DeletePlan, pager: &mut Pager, catalog: &Catalog) -> Re
 
     let rows_affected = to_delete.len() as u64;
     let table_indexes = get_table_indexes(catalog, &plan.table_name);
+
+    if let Some(table_def) = catalog.get_table(&plan.table_name) {
+        let table_columns_def = table_def.columns.clone();
+        for &rowid in &to_delete {
+            let old_values = row_values_for_rowid(&btree_rows, rowid, &plan.table_columns);
+            check_foreign_key_delete(rowid, &old_values, &plan.table_name, &table_columns_def, pager, catalog)?;
+        }
+    }
 
     for rowid in to_delete {
         for (idx_root, idx_col_indices) in &table_indexes {

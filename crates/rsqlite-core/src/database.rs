@@ -68,6 +68,10 @@ impl Database {
 
     pub fn execute(&mut self, sql: &str) -> Result<ExecResult> {
         let plan = self.get_or_plan(sql)?;
+        if let Plan::Pragma { ref name, ref argument } = plan {
+            let _ = executor::execute_pragma(name, argument.as_deref(), &self.pager, &self.catalog)?;
+            return Ok(ExecResult { rows_affected: 0 });
+        }
         let is_ddl = matches!(
             plan,
             Plan::CreateTable(_)

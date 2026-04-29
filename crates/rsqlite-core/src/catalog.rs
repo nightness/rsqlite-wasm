@@ -59,6 +59,14 @@ pub struct TableDef {
     pub sql: Option<String>,
     pub check_constraints: Vec<String>,
     pub has_autoincrement: bool,
+    pub foreign_keys: Vec<ForeignKeyDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForeignKeyDef {
+    pub from_columns: Vec<String>,
+    pub to_table: String,
+    pub to_columns: Vec<String>,
 }
 
 impl TableDef {
@@ -131,6 +139,10 @@ impl Catalog {
         self.tables.get(&name.to_lowercase())
     }
 
+    pub fn all_tables(&self) -> impl Iterator<Item = &TableDef> {
+        self.tables.values()
+    }
+
     pub fn get_view(&self, name: &str) -> Option<&ViewDef> {
         self.views.get(&name.to_lowercase())
     }
@@ -161,6 +173,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 sql: Some(sql.clone()),
                 check_constraints: vec![],
                 has_autoincrement: false,
+                foreign_keys: vec![],
             }));
         }
     };
@@ -255,6 +268,28 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
 
         let has_autoincrement = columns.iter().any(|c| c.autoincrement);
 
+        let mut foreign_keys = Vec::new();
+        for (i, col) in ct.columns.iter().enumerate() {
+            for opt in &col.options {
+                if let ColumnOption::ForeignKey { foreign_table, referred_columns, .. } = &opt.option {
+                    foreign_keys.push(ForeignKeyDef {
+                        from_columns: vec![columns[i].name.clone()],
+                        to_table: foreign_table.to_string(),
+                        to_columns: referred_columns.iter().map(|c| c.value.clone()).collect(),
+                    });
+                }
+            }
+        }
+        for constraint in &ct.constraints {
+            if let ast::TableConstraint::ForeignKey { columns: fk_cols, foreign_table, referred_columns, .. } = constraint {
+                foreign_keys.push(ForeignKeyDef {
+                    from_columns: fk_cols.iter().map(|c| c.value.clone()).collect(),
+                    to_table: foreign_table.to_string(),
+                    to_columns: referred_columns.iter().map(|c| c.value.clone()).collect(),
+                });
+            }
+        }
+
         Ok(Some(TableDef {
             name: entry.name.clone(),
             columns,
@@ -262,6 +297,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
             sql: Some(sql.clone()),
             check_constraints,
             has_autoincrement,
+            foreign_keys,
         }))
     } else {
         Ok(None)

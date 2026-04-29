@@ -30,6 +30,17 @@ fn preprocess_pragma(sql: &str) -> String {
             }
         }
     }
+    if let Some(eq_pos) = after_pragma.find('=') {
+        let name = after_pragma[..eq_pos].trim();
+        let val = after_pragma[eq_pos + 1..].trim().trim_end_matches(';');
+        let val = val.trim();
+        if val.eq_ignore_ascii_case("ON") || val.eq_ignore_ascii_case("YES") || val.eq_ignore_ascii_case("TRUE") {
+            return format!("PRAGMA {name} = 1;");
+        }
+        if val.eq_ignore_ascii_case("OFF") || val.eq_ignore_ascii_case("NO") || val.eq_ignore_ascii_case("FALSE") {
+            return format!("PRAGMA {name} = 0;");
+        }
+    }
     sql.to_string()
 }
 

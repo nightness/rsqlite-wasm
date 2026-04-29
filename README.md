@@ -12,7 +12,7 @@ Databases created by rsqlite-wasm are **file-format compatible** with SQLite —
 - **Web Worker architecture** — all I/O runs off the main thread
 - **Vector search** — built-in `vec_distance_cosine`, `vec_distance_l2`, and `vec_distance_dot` functions for embedding similarity search
 - **Small binary** — ~1.6 MB WASM with LTO + `opt-level=z`
-- **315+ tests** — comprehensive coverage across all crates
+- **320+ tests** — comprehensive coverage across all crates
 
 ## SQL Support
 
@@ -29,9 +29,9 @@ Databases created by rsqlite-wasm are **file-format compatible** with SQLite —
 - **DDL:** CREATE TABLE, CREATE INDEX, DROP TABLE/INDEX/VIEW, ALTER TABLE (ADD COLUMN, RENAME)
 - **Transactions:** BEGIN, COMMIT, ROLLBACK with rollback journal; SAVEPOINT, RELEASE, ROLLBACK TO
 - **Indexes:** B-tree indexes with equality and range scan optimization
-- **Constraints:** NOT NULL, UNIQUE, CHECK enforcement; AUTOINCREMENT via sqlite_sequence
+- **Constraints:** NOT NULL, UNIQUE, CHECK, FOREIGN KEY enforcement; AUTOINCREMENT via sqlite_sequence
 - **UPSERT:** INSERT ... ON CONFLICT DO UPDATE/NOTHING, INSERT OR REPLACE/IGNORE
-- **PRAGMA:** table_info, table_list, index_list, index_info, page_size, page_count, integrity_check
+- **PRAGMA:** table_info, table_list, index_list, index_info, page_size, page_count, integrity_check, foreign_keys
 - **EXPLAIN QUERY PLAN:** human-readable query plan output
 - **Window functions:** ROW_NUMBER, RANK, DENSE_RANK, NTILE, LAG, LEAD, FIRST_VALUE, LAST_VALUE, SUM/COUNT/AVG/MIN/MAX OVER
 - **Vector search:** `vec_distance_cosine`, `vec_distance_l2`, `vec_distance_dot`, `vec_from_json`, `vec_to_json`, `vec_normalize`, `vec_length`
@@ -45,7 +45,6 @@ Databases created by rsqlite-wasm are **file-format compatible** with SQLite —
 
 - Recursive CTEs (WITH RECURSIVE)
 - Triggers
-- FOREIGN KEY constraint enforcement
 - WAL mode
 - VACUUM, ATTACH DATABASE
 

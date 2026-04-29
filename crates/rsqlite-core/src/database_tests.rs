@@ -4411,3 +4411,71 @@
         assert_eq!(r.rows[0].values[0], Value::Text("t".into()));
         assert_eq!(r.rows[0].values[1], Value::Integer(2));
     }
+
+    // ── FOREIGN KEY tests ──
+
+    #[test]
+    fn foreign_key_insert_valid() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("PRAGMA foreign_keys = ON").unwrap();
+        db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))").unwrap();
+        db.execute("INSERT INTO parent VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+
+        let r = db.query("SELECT * FROM child").unwrap();
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    #[test]
+    fn foreign_key_insert_violation() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("PRAGMA foreign_keys = ON").unwrap();
+        db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))").unwrap();
+
+        let result = db.execute("INSERT INTO child VALUES (1, 999)");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("FOREIGN KEY"));
+    }
+
+    #[test]
+    fn foreign_key_delete_violation() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("PRAGMA foreign_keys = ON").unwrap();
+        db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))").unwrap();
+        db.execute("INSERT INTO parent VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO child VALUES (1, 1)").unwrap();
+
+        let result = db.execute("DELETE FROM parent WHERE id = 1");
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("FOREIGN KEY"));
+    }
+
+    #[test]
+    fn foreign_key_off_by_default() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))").unwrap();
+        // Should succeed even without a parent row since FK enforcement is off
+        db.execute("INSERT INTO child VALUES (1, 999)").unwrap();
+    }
+
+    #[test]
+    fn foreign_key_null_allowed() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("PRAGMA foreign_keys = ON").unwrap();
+        db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)").unwrap();
+        db.execute("CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id))").unwrap();
+        // NULL FK values should be allowed (SQL standard behavior)
+        db.execute("INSERT INTO child VALUES (1, NULL)").unwrap();
+
+        let r = db.query("SELECT * FROM child").unwrap();
+        assert_eq!(r.rows.len(), 1);
+    }
