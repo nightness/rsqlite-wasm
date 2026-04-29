@@ -2,10 +2,7 @@ export type { SqlValue, BindParams, Row, DatabaseOptions } from "./types.js";
 
 interface WasmModule {
   default: (input?: RequestInfo | URL) => Promise<unknown>;
-  WasmDatabase: {
-    new (): WasmDatabaseInstance;
-    openInMemory(): WasmDatabaseInstance;
-  };
+  WasmDatabase: WasmDatabaseConstructor;
 }
 
 interface WasmDatabaseInstance {
@@ -16,6 +13,12 @@ interface WasmDatabaseInstance {
   toBuffer(): Uint8Array;
   close(): void;
   free(): void;
+}
+
+interface WasmDatabaseConstructor {
+  new (): WasmDatabaseInstance;
+  openInMemory(): WasmDatabaseInstance;
+  fromBuffer(data: Uint8Array): WasmDatabaseInstance;
 }
 
 import type { Row, DatabaseOptions } from "./types.js";
@@ -60,6 +63,14 @@ export class Database {
   static async openInMemory(): Promise<Database> {
     const mod = await loadWasm();
     const inner = mod.WasmDatabase.openInMemory();
+    return new Database(inner);
+  }
+
+  static async fromBuffer(buffer: Uint8Array | ArrayBuffer): Promise<Database> {
+    const mod = await loadWasm();
+    const data =
+      buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    const inner = mod.WasmDatabase.fromBuffer(data);
     return new Database(inner);
   }
 

@@ -35,6 +35,27 @@ impl WasmDatabase {
         WasmDatabase::new()
     }
 
+    #[wasm_bindgen(js_name = "fromBuffer")]
+    pub fn from_buffer(data: &[u8]) -> Result<WasmDatabase, JsError> {
+        use rsqlite_vfs::OpenFlags;
+
+        let vfs = MemoryVfs::new();
+        let path = "imported.db".to_string();
+
+        {
+            let flags = OpenFlags {
+                create: true,
+                read_write: true,
+                delete_on_close: false,
+            };
+            let mut file = vfs.open(&path, flags).map_err(to_js_error)?;
+            file.write(0, data).map_err(to_js_error)?;
+        }
+
+        let db = Database::open(&vfs, &path).map_err(to_js_error)?;
+        Ok(WasmDatabase { db, vfs, path })
+    }
+
     pub fn exec(&mut self, sql: &str) -> Result<u64, JsError> {
         let result = self.db.execute(sql).map_err(to_js_error)?;
         Ok(result.rows_affected)

@@ -41,8 +41,26 @@ const agg = db.query('SELECT u.name, COUNT(*) as order_count, SUM(o.amount) as t
 console.log('\nAggregate query:');
 console.log(JSON.stringify(agg, null, 2));
 
+// Test round-trip: export -> import -> query
 const buf = db.toBuffer();
 console.log(`\nDatabase export: ${buf.length} bytes`);
-
 db.free();
+
+console.log('\n--- Round-trip test: importing exported database ---');
+const db2 = WasmDatabase.fromBuffer(buf);
+const reimported = db2.query('SELECT * FROM users ORDER BY id');
+console.log('SELECT * FROM users (reimported):');
+console.log(JSON.stringify(reimported, null, 2));
+
+const reimportedOrders = db2.query('SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id');
+console.log('\nJOIN query (reimported):');
+console.log(JSON.stringify(reimportedOrders, null, 2));
+
+// Verify we can still write to the reimported database
+db2.exec("INSERT INTO users VALUES (4, 'Dave', 40)");
+const afterInsert = db2.query('SELECT COUNT(*) as cnt FROM users');
+console.log('\nCount after insert into reimported db:');
+console.log(JSON.stringify(afterInsert, null, 2));
+
+db2.free();
 console.log('\n=== All tests passed! ===');
