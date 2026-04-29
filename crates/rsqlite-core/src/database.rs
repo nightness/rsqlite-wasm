@@ -2165,4 +2165,99 @@ mod tests {
         let r = db.query("SELECT CAST(val AS REAL) AS f FROM t").unwrap();
         assert_eq!(r.rows[0].values[0], crate::types::Value::Real(42.0));
     }
+
+    #[test]
+    fn alter_table_add_column() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+
+        db.execute("ALTER TABLE t ADD COLUMN age INTEGER").unwrap();
+
+        db.execute("INSERT INTO t VALUES (2, 'Bob', 25)").unwrap();
+
+        let r = db.query("SELECT * FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(1));
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Text("Alice".to_string()));
+        assert_eq!(r.rows[0].values[2], crate::types::Value::Null);
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Integer(2));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Text("Bob".to_string()));
+        assert_eq!(r.rows[1].values[2], crate::types::Value::Integer(25));
+    }
+
+    #[test]
+    fn alter_table_add_column_query_new_column() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob')").unwrap();
+
+        db.execute("ALTER TABLE t ADD COLUMN score REAL").unwrap();
+
+        let r = db.query("SELECT name, score FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Null);
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Null);
+
+        db.execute("UPDATE t SET score = 95.5 WHERE id = 1").unwrap();
+        let r = db.query("SELECT name, score FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Real(95.5));
+    }
+
+    #[test]
+    fn alter_table_add_column_duplicate_error() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+
+        let err = db.execute("ALTER TABLE t ADD COLUMN name TEXT").unwrap_err();
+        assert!(err.to_string().contains("duplicate column name"));
+    }
+
+    #[test]
+    fn alter_table_add_column_no_type() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)").unwrap();
+
+        db.execute("ALTER TABLE t ADD COLUMN extra").unwrap();
+
+        db.execute("INSERT INTO t VALUES (1, 'hello')").unwrap();
+        let r = db.query("SELECT extra FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("hello".to_string()));
+    }
+
+    #[test]
+    fn alter_table_add_column_pragma_table_info() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("ALTER TABLE t ADD COLUMN age INTEGER").unwrap();
+
+        let r = db.query("PRAGMA table_info(t)").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[2].values[1], crate::types::Value::Text("age".to_string()));
+        assert_eq!(r.rows[2].values[2], crate::types::Value::Text("INTEGER".to_string()));
+    }
+
+    #[test]
+    fn alter_table_nonexistent_error() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        let err = db.execute("ALTER TABLE nonexistent ADD COLUMN x TEXT").unwrap_err();
+        assert!(err.to_string().contains("no such table"));
+    }
 }

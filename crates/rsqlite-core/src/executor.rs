@@ -15,6 +15,7 @@ use crate::planner::{
 };
 use crate::types::{QueryResult, Row};
 
+#[derive(Debug)]
 pub struct ExecResult {
     pub rows_affected: u64,
 }
@@ -116,6 +117,7 @@ pub fn execute(plan: &Plan, pager: &mut Pager) -> Result<QueryResult> {
         | Plan::Insert(_)
         | Plan::Update(_)
         | Plan::Delete(_)
+        | Plan::AlterTableAddColumn { .. }
         | Plan::DropTable { .. }
         | Plan::DropIndex { .. }
         | Plan::Begin
@@ -137,6 +139,11 @@ pub fn execute_mut(
         Plan::Insert(ins) => execute_insert(ins, pager, catalog),
         Plan::Update(upd) => execute_update(upd, pager, catalog),
         Plan::Delete(del) => execute_delete(del, pager, catalog),
+        Plan::AlterTableAddColumn {
+            table_name,
+            column_name,
+            column_type,
+        } => execute_alter_add_column(table_name, column_name, column_type, pager, catalog),
         Plan::DropTable {
             table_name,
             if_exists,
@@ -442,6 +449,100 @@ fn execute_create_index(
 
     catalog.reload(pager)?;
 
+    Ok(ExecResult { rows_affected: 0 })
+}
+
+fn execute_alter_add_column(
+    table_name: &str,
+    column_name: &str,
+    column_type: &str,
+    pager: &mut Pager,
+    catalog: &mut Catalog,
+) -> Result<ExecResult> {
+    let table = catalog.get_table(table_name).ok_or_else(|| {
+        Error::Other(format!("no such table: {table_name}"))
+    })?;
+
+    if table
+        .columns
+        .iter()
+        .any(|c| c.name.eq_ignore_ascii_case(column_name))
+    {
+        return Err(Error::Other(format!(
+            "duplicate column name: {column_name}"
+        )));
+    }
+
+    let mut cursor = BTreeCursor::new(pager, 1);
+    let mut target_rowid = None;
+    let mut original_record = None;
+    let mut has_row = cursor.first().map_err(|e| Error::Other(e.to_string()))?;
+    while has_row {
+        let current = cursor.current().map_err(|e| Error::Other(e.to_string()))?;
+        let is_match = current.record.values.get(1).is_some_and(|v| {
+            if let Value::Text(s) = v {
+                s.eq_ignore_ascii_case(table_name)
+            } else {
+                false
+            }
+        }) && current.record.values.first().is_some_and(|v| {
+            if let Value::Text(s) = v {
+                s == "table"
+            } else {
+                false
+            }
+        });
+        if is_match {
+            target_rowid = Some(current.rowid);
+            original_record = Some(current.record);
+            break;
+        }
+        has_row = cursor.next().map_err(|e| Error::Other(e.to_string()))?;
+    }
+
+    let rowid = target_rowid.ok_or_else(|| {
+        Error::Other(format!("schema entry not found for table: {table_name}"))
+    })?;
+    let record = original_record.unwrap();
+
+    let old_sql = match &record.values[4] {
+        Value::Text(s) => s.clone(),
+        _ => {
+            return Err(Error::Other(
+                "invalid schema SQL".to_string(),
+            ))
+        }
+    };
+
+    let col_def = if column_type.is_empty() {
+        column_name.to_string()
+    } else {
+        format!("{column_name} {column_type}")
+    };
+    let new_sql = if let Some(pos) = old_sql.rfind(')') {
+        format!("{}, {col_def})", &old_sql[..pos])
+    } else {
+        return Err(Error::Other("malformed CREATE TABLE SQL".to_string()));
+    };
+
+    let mut new_values = record.values.clone();
+    new_values[4] = Value::Text(new_sql);
+    let new_record = Record { values: new_values };
+
+    btree_delete(pager, 1, rowid).map_err(|e| Error::Other(e.to_string()))?;
+    let new_root = btree_insert(pager, 1, rowid, &new_record)
+        .map_err(|e| Error::Other(e.to_string()))?;
+    if new_root != 1 {
+        return Err(Error::Other(
+            "sqlite_schema root page split — not yet supported".to_string(),
+        ));
+    }
+
+    if !pager.in_transaction() {
+        pager.flush()?;
+    }
+
+    catalog.reload(pager)?;
     Ok(ExecResult { rows_affected: 0 })
 }
 

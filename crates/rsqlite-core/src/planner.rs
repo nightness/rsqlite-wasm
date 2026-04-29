@@ -128,6 +128,11 @@ pub enum Plan {
         index_name: String,
         if_exists: bool,
     },
+    AlterTableAddColumn {
+        table_name: String,
+        column_name: String,
+        column_type: String,
+    },
     Pragma {
         name: String,
         argument: Option<String>,
@@ -273,6 +278,34 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
                     if_exists: *if_exists,
                 }),
                 other => Err(Error::Other(format!("unsupported DROP {other}"))),
+            }
+        }
+        Statement::AlterTable {
+            name, operations, ..
+        } => {
+            let table_name = name.to_string();
+            if operations.len() != 1 {
+                return Err(Error::Other(
+                    "only single ALTER TABLE operations supported".to_string(),
+                ));
+            }
+            match &operations[0] {
+                ast::AlterTableOperation::AddColumn { column_def, .. } => {
+                    let col_name = column_def.name.value.clone();
+                    let col_type = if column_def.data_type == ast::DataType::Unspecified {
+                        String::new()
+                    } else {
+                        column_def.data_type.to_string()
+                    };
+                    Ok(Plan::AlterTableAddColumn {
+                        table_name,
+                        column_name: col_name,
+                        column_type: col_type,
+                    })
+                }
+                other => Err(Error::Other(format!(
+                    "unsupported ALTER TABLE operation: {other}"
+                ))),
             }
         }
         Statement::Pragma { name, value, .. } => {
