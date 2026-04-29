@@ -277,6 +277,17 @@ pub(crate) fn eval_scalar_function(name: &str, args: &[Value]) -> Result<Value> 
             }
         }
         "RANDOM" => Ok(Value::Integer(rand_i64())),
+        "GLOB" => {
+            if args.len() != 2 {
+                return Err(Error::Other("GLOB requires 2 arguments".into()));
+            }
+            if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+                return Ok(Value::Null);
+            }
+            let pattern = value_to_text(&args[0]);
+            let value = value_to_text(&args[1]);
+            Ok(Value::Integer(if glob_match(&pattern, &value) { 1 } else { 0 }))
+        }
         _ => Err(Error::Other(format!("unknown function: {name}"))),
     }
 }
@@ -327,6 +338,94 @@ pub(crate) fn like_match_inner(pattern: &[char], value: &[char]) -> bool {
         pi += 1;
     }
     pi == pattern.len()
+}
+
+pub(crate) fn glob_match(pattern: &str, value: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let val: Vec<char> = value.chars().collect();
+    glob_match_inner(&pat, &val)
+}
+
+fn glob_match_inner(pattern: &[char], value: &[char]) -> bool {
+    let mut pi = 0;
+    let mut vi = 0;
+    let mut star_pi = usize::MAX;
+    let mut star_vi = 0;
+
+    while vi < value.len() {
+        if pi < pattern.len() && pattern[pi] == '*' {
+            star_pi = pi;
+            star_vi = vi;
+            pi += 1;
+        } else if pi < pattern.len()
+            && (pattern[pi] == '?' || pattern[pi] == value[vi])
+        {
+            pi += 1;
+            vi += 1;
+        } else if pi < pattern.len() && pattern[pi] == '[' {
+            if let Some((end, matched)) = match_char_class(&pattern[pi..], value[vi]) {
+                if matched {
+                    pi += end;
+                    vi += 1;
+                } else if star_pi != usize::MAX {
+                    pi = star_pi + 1;
+                    star_vi += 1;
+                    vi = star_vi;
+                } else {
+                    return false;
+                }
+            } else if star_pi != usize::MAX {
+                pi = star_pi + 1;
+                star_vi += 1;
+                vi = star_vi;
+            } else {
+                return false;
+            }
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_vi += 1;
+            vi = star_vi;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern[pi] == '*' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+fn match_char_class(pattern: &[char], ch: char) -> Option<(usize, bool)> {
+    if pattern.is_empty() || pattern[0] != '[' {
+        return None;
+    }
+    let mut i = 1;
+    let negated = i < pattern.len() && pattern[i] == '^';
+    if negated {
+        i += 1;
+    }
+    let mut matched = false;
+    while i < pattern.len() && pattern[i] != ']' {
+        if i + 2 < pattern.len() && pattern[i + 1] == '-' {
+            let lo = pattern[i];
+            let hi = pattern[i + 2];
+            if ch >= lo && ch <= hi {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if pattern[i] == ch {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    if i < pattern.len() && pattern[i] == ']' {
+        Some((i + 1, matched != negated))
+    } else {
+        None
+    }
 }
 
 pub(crate) fn eval_cast(val: Value, type_name: &str) -> Result<Value> {

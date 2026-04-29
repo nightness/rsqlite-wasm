@@ -2677,3 +2677,58 @@
         assert_eq!(r.rows[0].values[0], crate::types::Value::Text("North".to_string()));
         assert_eq!(r.rows[0].values[1], crate::types::Value::Real(250.0));
     }
+
+    #[test]
+    fn glob_function_star() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'alice')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'Bob')").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'ALICE')").unwrap();
+
+        // GLOB is case-sensitive, * matches any sequence
+        let r = db.query("SELECT name FROM t WHERE glob('A*', name) ORDER BY name").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("ALICE".to_string()));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Text("Alice".to_string()));
+    }
+
+    #[test]
+    fn glob_function_question_mark() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'cat')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'car')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'card')").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'ca')").unwrap();
+
+        // ? matches exactly one character
+        let r = db.query("SELECT name FROM t WHERE glob('ca?', name) ORDER BY name").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("car".to_string()));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Text("cat".to_string()));
+    }
+
+    #[test]
+    fn glob_function_char_class() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a1')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'b2')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'c3')").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'd4')").unwrap();
+
+        // [a-c] matches a, b, or c
+        let r = db.query("SELECT val FROM t WHERE glob('[a-c]*', val) ORDER BY val").unwrap();
+        assert_eq!(r.rows.len(), 3);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("a1".to_string()));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Text("b2".to_string()));
+        assert_eq!(r.rows[2].values[0], crate::types::Value::Text("c3".to_string()));
+    }

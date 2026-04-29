@@ -485,7 +485,7 @@ fn plan_function_expr(func: &ast::Function, columns: &[ColumnRef], catalog: &Cat
     static KNOWN_SCALARS: &[&str] = &[
         "LENGTH", "SUBSTR", "SUBSTRING", "UPPER", "LOWER", "TRIM", "LTRIM", "RTRIM",
         "REPLACE", "INSTR", "COALESCE", "IFNULL", "NULLIF", "TYPEOF", "ABS", "RANDOM",
-        "HEX", "QUOTE", "ZEROBLOB", "UNICODE", "CHAR",
+        "HEX", "QUOTE", "ZEROBLOB", "UNICODE", "CHAR", "GLOB",
     ];
 
     if KNOWN_SCALARS.contains(&name.as_str()) {
