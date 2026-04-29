@@ -29,6 +29,23 @@ pub struct InsertPlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct UpdatePlan {
+    pub table_name: String,
+    pub root_page: u32,
+    pub table_columns: Vec<ColumnRef>,
+    pub assignments: Vec<(String, PlanExpr)>,
+    pub predicate: Option<PlanExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeletePlan {
+    pub table_name: String,
+    pub root_page: u32,
+    pub table_columns: Vec<ColumnRef>,
+    pub predicate: Option<PlanExpr>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Plan {
     Scan {
         table: String,
@@ -45,6 +62,8 @@ pub enum Plan {
     },
     CreateTable(CreateTablePlan),
     Insert(InsertPlan),
+    Update(UpdatePlan),
+    Delete(DeletePlan),
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +135,13 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
         Statement::Query(query) => plan_select(query, catalog),
         Statement::CreateTable(ct) => plan_create_table(ct),
         Statement::Insert(insert) => plan_insert(insert, catalog),
+        Statement::Update {
+            table,
+            assignments,
+            selection,
+            ..
+        } => plan_update(table, assignments, selection.as_ref(), catalog),
+        Statement::Delete(delete) => plan_delete(delete, catalog),
         _ => Err(Error::Other(format!(
             "unsupported statement type: {stmt}"
         ))),
@@ -449,5 +475,109 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
         table_columns: all_columns,
         target_columns,
         rows,
+    }))
+}
+
+fn plan_update(
+    table: &ast::TableWithJoins,
+    assignments: &[ast::Assignment],
+    selection: Option<&Expr>,
+    catalog: &Catalog,
+) -> Result<Plan> {
+    let table_name = match &table.relation {
+        TableFactor::Table { name, .. } => name.to_string(),
+        _ => {
+            return Err(Error::Other(
+                "only simple table references are supported in UPDATE".to_string(),
+            ))
+        }
+    };
+
+    let table_def = catalog.get_table(&table_name).ok_or_else(|| {
+        Error::Other(format!("table not found: {table_name}"))
+    })?;
+
+    let all_columns: Vec<ColumnRef> = table_def
+        .columns
+        .iter()
+        .map(|c| ColumnRef {
+            name: c.name.clone(),
+            column_index: c.column_index,
+            is_rowid_alias: c.is_rowid_alias,
+        })
+        .collect();
+
+    let mut planned_assignments = Vec::new();
+    for assignment in assignments {
+        let col_name = match &assignment.target {
+            ast::AssignmentTarget::ColumnName(name) => name.to_string(),
+            ast::AssignmentTarget::Tuple(_) => {
+                return Err(Error::Other(
+                    "tuple assignment not supported".to_string(),
+                ))
+            }
+        };
+        let expr = plan_expr(&assignment.value, &all_columns)?;
+        planned_assignments.push((col_name, expr));
+    }
+
+    let predicate = selection
+        .map(|s| plan_expr(s, &all_columns))
+        .transpose()?;
+
+    Ok(Plan::Update(UpdatePlan {
+        table_name,
+        root_page: table_def.root_page,
+        table_columns: all_columns,
+        assignments: planned_assignments,
+        predicate,
+    }))
+}
+
+fn plan_delete(delete: &ast::Delete, catalog: &Catalog) -> Result<Plan> {
+    let tables = match &delete.from {
+        ast::FromTable::WithFromKeyword(tables) | ast::FromTable::WithoutKeyword(tables) => tables,
+    };
+
+    if tables.len() != 1 {
+        return Err(Error::Other(
+            "exactly one table in DELETE FROM is required".to_string(),
+        ));
+    }
+
+    let table_name = match &tables[0].relation {
+        TableFactor::Table { name, .. } => name.to_string(),
+        _ => {
+            return Err(Error::Other(
+                "only simple table references are supported in DELETE".to_string(),
+            ))
+        }
+    };
+
+    let table_def = catalog.get_table(&table_name).ok_or_else(|| {
+        Error::Other(format!("table not found: {table_name}"))
+    })?;
+
+    let all_columns: Vec<ColumnRef> = table_def
+        .columns
+        .iter()
+        .map(|c| ColumnRef {
+            name: c.name.clone(),
+            column_index: c.column_index,
+            is_rowid_alias: c.is_rowid_alias,
+        })
+        .collect();
+
+    let predicate = delete
+        .selection
+        .as_ref()
+        .map(|s| plan_expr(s, &all_columns))
+        .transpose()?;
+
+    Ok(Plan::Delete(DeletePlan {
+        table_name,
+        root_page: table_def.root_page,
+        table_columns: all_columns,
+        predicate,
     }))
 }

@@ -448,4 +448,171 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    #[test]
+    fn update_rows() {
+        let db_path = "/tmp/rsqlite_db_update.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice', 80)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob', 90)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'Charlie', 70)").unwrap();
+
+        let result = db.execute("UPDATE t SET score = 100 WHERE name = 'Bob'").unwrap();
+        assert_eq!(result.rows_affected, 1);
+
+        let result = db.query("SELECT * FROM t WHERE name = 'Bob'").unwrap();
+        use rsqlite_storage::codec::Value;
+        assert_eq!(result.rows[0].values[2], Value::Integer(100));
+
+        // Other rows unchanged
+        let result = db.query("SELECT score FROM t WHERE name = 'Alice'").unwrap();
+        assert_eq!(result.rows[0].values[0], Value::Integer(80));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn update_all_rows() {
+        let db_path = "/tmp/rsqlite_db_update_all.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+
+        let result = db.execute("UPDATE t SET val = 0").unwrap();
+        assert_eq!(result.rows_affected, 3);
+
+        let result = db.query("SELECT * FROM t").unwrap();
+        use rsqlite_storage::codec::Value;
+        for row in &result.rows {
+            assert_eq!(row.values[1], Value::Integer(0));
+        }
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn delete_rows() {
+        let db_path = "/tmp/rsqlite_db_delete.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'Charlie')").unwrap();
+
+        let result = db.execute("DELETE FROM t WHERE name = 'Bob'").unwrap();
+        assert_eq!(result.rows_affected, 1);
+
+        let result = db.query("SELECT * FROM t").unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        use rsqlite_storage::codec::Value;
+        assert_eq!(result.rows[0].values[1], Value::Text("Alice".to_string()));
+        assert_eq!(result.rows[1].values[1], Value::Text("Charlie".to_string()));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn delete_all_rows() {
+        let db_path = "/tmp/rsqlite_db_delete_all.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+
+        let result = db.execute("DELETE FROM t").unwrap();
+        assert_eq!(result.rows_affected, 2);
+
+        let result = db.query("SELECT * FROM t").unwrap();
+        assert_eq!(result.rows.len(), 0);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn full_crud_cycle() {
+        let db_path = "/tmp/rsqlite_db_crud.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        // Create
+        db.execute("CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)")
+            .unwrap();
+
+        // Insert
+        db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (2, 'Gadget', 24.99)")
+            .unwrap();
+        db.execute("INSERT INTO products VALUES (3, 'Doohickey', 3.14)")
+            .unwrap();
+
+        // Read
+        let result = db.query("SELECT * FROM products").unwrap();
+        assert_eq!(result.rows.len(), 3);
+
+        // Update
+        db.execute("UPDATE products SET price = 19.99 WHERE name = 'Widget'")
+            .unwrap();
+        let result = db
+            .query("SELECT price FROM products WHERE name = 'Widget'")
+            .unwrap();
+        use rsqlite_storage::codec::Value;
+        assert_eq!(result.rows[0].values[0], Value::Real(19.99));
+
+        // Delete
+        db.execute("DELETE FROM products WHERE name = 'Doohickey'")
+            .unwrap();
+        let result = db.query("SELECT * FROM products").unwrap();
+        assert_eq!(result.rows.len(), 2);
+
+        // Verify with sqlite3
+        drop(db);
+        let output = match std::process::Command::new("sqlite3")
+            .arg(db_path)
+            .arg("SELECT * FROM products ORDER BY id;")
+            .output()
+        {
+            Ok(o) if o.status.success() => {
+                String::from_utf8_lossy(&o.stdout).to_string()
+            }
+            _ => {
+                let _ = std::fs::remove_file(db_path);
+                return;
+            }
+        };
+
+        let lines: Vec<&str> = output.trim().lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].contains("Widget"));
+        assert!(lines[0].contains("19.99"));
+        assert!(lines[1].contains("Gadget"));
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }

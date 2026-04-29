@@ -1,5 +1,6 @@
 use rsqlite_storage::btree::{
-    btree_create_table, btree_insert, btree_max_rowid, insert_schema_entry, BTreeCursor,
+    btree_create_table, btree_delete, btree_insert, btree_max_rowid, insert_schema_entry,
+    BTreeCursor,
 };
 use rsqlite_storage::codec::{Record, Value};
 use rsqlite_storage::pager::Pager;
@@ -7,8 +8,8 @@ use rsqlite_storage::pager::Pager;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::planner::{
-    BinOp, ColumnRef, CreateTablePlan, InsertPlan, LiteralValue, Plan, PlanExpr, ProjectionItem,
-    UnaryOp,
+    BinOp, ColumnRef, CreateTablePlan, DeletePlan, InsertPlan, LiteralValue, Plan, PlanExpr,
+    ProjectionItem, UnaryOp, UpdatePlan,
 };
 use crate::types::{QueryResult, Row};
 
@@ -39,9 +40,11 @@ pub fn execute(plan: &Plan, pager: &mut Pager) -> Result<QueryResult> {
             columns,
             ..
         } => execute_scan(*root_page, columns, pager),
-        Plan::CreateTable(_) | Plan::Insert(_) => Err(Error::Other(
-            "use execute_mut for DDL/DML statements".to_string(),
-        )),
+        Plan::CreateTable(_) | Plan::Insert(_) | Plan::Update(_) | Plan::Delete(_) => {
+            Err(Error::Other(
+                "use execute_mut for DDL/DML statements".to_string(),
+            ))
+        }
     }
 }
 
@@ -53,6 +56,8 @@ pub fn execute_mut(
     match plan {
         Plan::CreateTable(ct) => execute_create_table(ct, pager, catalog),
         Plan::Insert(ins) => execute_insert(ins, pager),
+        Plan::Update(upd) => execute_update(upd, pager),
+        Plan::Delete(del) => execute_delete(del, pager),
         _ => Err(Error::Other(
             "use execute for query statements".to_string(),
         )),
@@ -179,6 +184,127 @@ fn eval_literal(expr: &PlanExpr) -> Result<Value> {
             "only literal values are supported in INSERT".to_string(),
         )),
     }
+}
+
+fn execute_update(plan: &UpdatePlan, pager: &mut Pager) -> Result<ExecResult> {
+    let column_names: Vec<String> = plan.table_columns.iter().map(|c| c.name.clone()).collect();
+
+    let mut cursor = BTreeCursor::new(pager, plan.root_page);
+    let btree_rows = cursor
+        .collect_all()
+        .map_err(|e| Error::Other(e.to_string()))?;
+
+    let mut to_update: Vec<(i64, Vec<Value>)> = Vec::new();
+
+    for btree_row in &btree_rows {
+        let record_values = &btree_row.record.values;
+        let mut row_values = Vec::with_capacity(plan.table_columns.len());
+
+        for col in &plan.table_columns {
+            if col.is_rowid_alias {
+                row_values.push(Value::Integer(btree_row.rowid));
+            } else {
+                let val = record_values
+                    .get(col.column_index)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                row_values.push(val);
+            }
+        }
+
+        let row = Row {
+            values: row_values,
+        };
+
+        let matches = match &plan.predicate {
+            Some(pred) => {
+                let val = eval_expr(pred, &row, &column_names)?;
+                is_truthy(&val)
+            }
+            None => true,
+        };
+
+        if matches {
+            let mut new_values = row.values.clone();
+            for (col_name, expr) in &plan.assignments {
+                let col_idx = column_names
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(col_name))
+                    .ok_or_else(|| {
+                        Error::Other(format!("unknown column: {col_name}"))
+                    })?;
+                new_values[col_idx] = eval_expr(expr, &row, &column_names)?;
+            }
+            to_update.push((btree_row.rowid, new_values));
+        }
+    }
+
+    let rows_affected = to_update.len() as u64;
+
+    let mut current_root = plan.root_page;
+    for (rowid, values) in to_update {
+        btree_delete(pager, current_root, rowid)?;
+        let record = Record { values };
+        current_root = btree_insert(pager, current_root, rowid, &record)?;
+    }
+
+    pager.flush()?;
+
+    Ok(ExecResult { rows_affected })
+}
+
+fn execute_delete(plan: &DeletePlan, pager: &mut Pager) -> Result<ExecResult> {
+    let column_names: Vec<String> = plan.table_columns.iter().map(|c| c.name.clone()).collect();
+
+    let mut cursor = BTreeCursor::new(pager, plan.root_page);
+    let btree_rows = cursor
+        .collect_all()
+        .map_err(|e| Error::Other(e.to_string()))?;
+
+    let mut to_delete: Vec<i64> = Vec::new();
+
+    for btree_row in &btree_rows {
+        let record_values = &btree_row.record.values;
+        let mut row_values = Vec::with_capacity(plan.table_columns.len());
+
+        for col in &plan.table_columns {
+            if col.is_rowid_alias {
+                row_values.push(Value::Integer(btree_row.rowid));
+            } else {
+                let val = record_values
+                    .get(col.column_index)
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                row_values.push(val);
+            }
+        }
+
+        let row = Row {
+            values: row_values,
+        };
+
+        let matches = match &plan.predicate {
+            Some(pred) => {
+                let val = eval_expr(pred, &row, &column_names)?;
+                is_truthy(&val)
+            }
+            None => true,
+        };
+
+        if matches {
+            to_delete.push(btree_row.rowid);
+        }
+    }
+
+    let rows_affected = to_delete.len() as u64;
+
+    for rowid in to_delete {
+        btree_delete(pager, plan.root_page, rowid)?;
+    }
+
+    pager.flush()?;
+
+    Ok(ExecResult { rows_affected })
 }
 
 fn execute_scan(
