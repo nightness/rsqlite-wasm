@@ -20,6 +20,7 @@ interface WasmDatabaseConstructor {
   new (): WasmDatabaseInstance;
   openInMemory(): WasmDatabaseInstance;
   openWithOpfs(name: string): Promise<WasmDatabaseInstance>;
+  openWithIdb(name: string): Promise<WasmDatabaseInstance>;
   fromBuffer(data: Uint8Array): WasmDatabaseInstance;
 }
 
@@ -62,6 +63,11 @@ export class Database {
 
     if (backend === "opfs") {
       const inner = await mod.WasmDatabase.openWithOpfs(name ?? "rsqlite");
+      return new Database(inner);
+    }
+
+    if (backend === "indexeddb") {
+      const inner = await mod.WasmDatabase.openWithIdb(name ?? "rsqlite");
       return new Database(inner);
     }
 

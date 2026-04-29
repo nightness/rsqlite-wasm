@@ -1,3 +1,4 @@
+mod idb;
 mod opfs;
 
 use wasm_bindgen::prelude::*;
@@ -15,6 +16,7 @@ pub fn init() {
 enum VfsBackend {
     Memory(MemoryVfs),
     Opfs(opfs::OpfsVfs),
+    Idb(idb::IdbVfs),
 }
 
 #[wasm_bindgen]
@@ -66,6 +68,29 @@ impl WasmDatabase {
         Ok(WasmDatabase {
             db,
             backend: VfsBackend::Opfs(vfs),
+            path: db_path,
+        })
+    }
+
+    #[wasm_bindgen(js_name = "openWithIdb")]
+    pub async fn open_with_idb(name: &str) -> Result<WasmDatabase, JsError> {
+        let idb_name = format!("rsqlite_{name}");
+        let vfs = idb::IdbVfs::new(&idb_name).await.map_err(jsval_to_js_error)?;
+        let db_path = if name.ends_with(".db") {
+            name.to_string()
+        } else {
+            format!("{name}.db")
+        };
+
+        let db = if vfs.exists(&db_path).unwrap_or(false) {
+            Database::open(&vfs, &db_path).map_err(to_js_error)?
+        } else {
+            Database::create(&vfs, &db_path).map_err(to_js_error)?
+        };
+
+        Ok(WasmDatabase {
+            db,
+            backend: VfsBackend::Idb(vfs),
             path: db_path,
         })
     }
@@ -162,6 +187,7 @@ impl WasmDatabase {
         let vfs: &dyn Vfs = match &self.backend {
             VfsBackend::Memory(v) => v,
             VfsBackend::Opfs(v) => v,
+            VfsBackend::Idb(v) => v,
         };
         let file = vfs.open(&self.path, flags).map_err(to_js_error)?;
         let size = file.file_size().map_err(to_js_error)? as usize;

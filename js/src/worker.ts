@@ -6,6 +6,7 @@ interface WasmModule {
     new (): WasmDatabaseInstance;
     openInMemory(): WasmDatabaseInstance;
     openWithOpfs(name: string): Promise<WasmDatabaseInstance>;
+    openWithIdb(name: string): Promise<WasmDatabaseInstance>;
     fromBuffer(data: Uint8Array): WasmDatabaseInstance;
   };
 }
@@ -56,6 +57,8 @@ async function handleMessage(msg: WorkerRequest): Promise<WorkerResponse> {
         const mod = await loadWasm();
         if (msg.backend === "opfs") {
           db = await mod.WasmDatabase.openWithOpfs(msg.name ?? "rsqlite");
+        } else if (msg.backend === "indexeddb") {
+          db = await mod.WasmDatabase.openWithIdb(msg.name ?? "rsqlite");
         } else {
           db = new mod.WasmDatabase();
         }
