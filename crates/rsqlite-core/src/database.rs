@@ -1998,4 +1998,171 @@ mod tests {
         assert_eq!(result.rows.len(), 1);
         assert_eq!(result.columns.len(), 3);
     }
+
+    #[test]
+    fn select_with_alias() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice', 30)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob', 25)").unwrap();
+
+        let result = db.query("SELECT name AS person, age AS years FROM t ORDER BY years").unwrap();
+        assert_eq!(result.columns, vec!["person", "years"]);
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Text("Bob".to_string()));
+    }
+
+    #[test]
+    fn select_aggregate_alias() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, cat TEXT, val INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a', 10)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'b', 20)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'a', 30)").unwrap();
+
+        let result = db.query("SELECT cat, COUNT(*) AS cnt, SUM(val) AS total FROM t GROUP BY cat ORDER BY cnt").unwrap();
+        assert_eq!(result.columns, vec!["cat", "cnt", "total"]);
+        assert_eq!(result.rows.len(), 2);
+    }
+
+    #[test]
+    fn like_operator() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'Charlie')").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'Alicia')").unwrap();
+
+        let r = db.query("SELECT name FROM t WHERE name LIKE 'Al%'").unwrap();
+        assert_eq!(r.rows.len(), 2);
+
+        let r = db.query("SELECT name FROM t WHERE name LIKE '%ob%'").unwrap();
+        assert_eq!(r.rows.len(), 1);
+
+        let r = db.query("SELECT name FROM t WHERE name LIKE '_o%'").unwrap();
+        assert_eq!(r.rows.len(), 1);
+
+        let r = db.query("SELECT name FROM t WHERE name NOT LIKE 'A%'").unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn between_operator() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .unwrap();
+        }
+
+        let r = db.query("SELECT val FROM t WHERE val BETWEEN 3 AND 7").unwrap();
+        assert_eq!(r.rows.len(), 5);
+
+        let r = db.query("SELECT val FROM t WHERE val NOT BETWEEN 3 AND 7").unwrap();
+        assert_eq!(r.rows.len(), 5);
+    }
+
+    #[test]
+    fn in_list_operator() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'Charlie')").unwrap();
+
+        let r = db.query("SELECT name FROM t WHERE id IN (1, 3)").unwrap();
+        assert_eq!(r.rows.len(), 2);
+
+        let r = db.query("SELECT name FROM t WHERE name IN ('Alice', 'Bob')").unwrap();
+        assert_eq!(r.rows.len(), 2);
+
+        let r = db.query("SELECT name FROM t WHERE id NOT IN (1)").unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn case_expression() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, age INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 20)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 35)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 50)").unwrap();
+
+        let r = db.query(
+            "SELECT id, CASE WHEN age < 30 THEN 'young' WHEN age < 40 THEN 'mid' ELSE 'senior' END AS bracket FROM t ORDER BY id"
+        ).unwrap();
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Text("young".to_string()));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Text("mid".to_string()));
+        assert_eq!(r.rows[2].values[1], crate::types::Value::Text("senior".to_string()));
+    }
+
+    #[test]
+    fn case_simple_form() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'active')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'inactive')").unwrap();
+
+        let r = db.query(
+            "SELECT CASE status WHEN 'active' THEN 1 WHEN 'inactive' THEN 0 END AS code FROM t ORDER BY id"
+        ).unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(1));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Integer(0));
+    }
+
+    #[test]
+    fn string_concat_operator() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, first TEXT, last TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'John', 'Doe')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Jane', 'Smith')").unwrap();
+
+        let r = db.query("SELECT first || ' ' || last AS full_name FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("John Doe".to_string()));
+        assert_eq!(r.rows[1].values[0], crate::types::Value::Text("Jane Smith".to_string()));
+    }
+
+    #[test]
+    fn cast_expression() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, '42')").unwrap();
+
+        let r = db.query("SELECT CAST(val AS INTEGER) AS num FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(42));
+
+        let r = db.query("SELECT CAST(id AS TEXT) AS txt FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("1".to_string()));
+
+        let r = db.query("SELECT CAST(val AS REAL) AS f FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Real(42.0));
+    }
 }

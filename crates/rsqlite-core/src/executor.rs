@@ -1440,6 +1440,72 @@ fn eval_expr(expr: &PlanExpr, row: &Row, columns: &[String]) -> Result<Value> {
                 .collect::<Result<Vec<_>>>()?;
             eval_scalar_function(name, &vals)
         }
+        PlanExpr::Like {
+            expr,
+            pattern,
+            negated,
+        } => {
+            let val = eval_expr(expr, row, columns)?;
+            let pat = eval_expr(pattern, row, columns)?;
+            if matches!(val, Value::Null) || matches!(pat, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let val_str = value_to_text(&val);
+            let pat_str = value_to_text(&pat);
+            let matched = like_match(&pat_str, &val_str);
+            let result = if *negated { !matched } else { matched };
+            Ok(Value::Integer(if result { 1 } else { 0 }))
+        }
+        PlanExpr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let val = eval_expr(expr, row, columns)?;
+            if matches!(val, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let mut found = false;
+            for item in list {
+                let item_val = eval_expr(item, row, columns)?;
+                if values_equal(&val, &item_val) {
+                    found = true;
+                    break;
+                }
+            }
+            let result = if *negated { !found } else { found };
+            Ok(Value::Integer(if result { 1 } else { 0 }))
+        }
+        PlanExpr::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            let op_val = operand
+                .as_ref()
+                .map(|e| eval_expr(e, row, columns))
+                .transpose()?;
+            for (condition, result) in when_clauses {
+                let cond_val = eval_expr(condition, row, columns)?;
+                let matched = if let Some(ref ov) = op_val {
+                    values_equal(ov, &cond_val)
+                } else {
+                    is_truthy(&cond_val)
+                };
+                if matched {
+                    return eval_expr(result, row, columns);
+                }
+            }
+            if let Some(else_expr) = else_result {
+                eval_expr(else_expr, row, columns)
+            } else {
+                Ok(Value::Null)
+            }
+        }
+        PlanExpr::Cast { expr, type_name } => {
+            let val = eval_expr(expr, row, columns)?;
+            eval_cast(val, type_name)
+        }
     }
 }
 
@@ -1731,6 +1797,87 @@ fn value_to_text(val: &Value) -> String {
     }
 }
 
+fn like_match(pattern: &str, value: &str) -> bool {
+    let pat: Vec<char> = pattern.chars().collect();
+    let val: Vec<char> = value.chars().collect();
+    like_match_inner(&pat, &val)
+}
+
+fn like_match_inner(pattern: &[char], value: &[char]) -> bool {
+    let mut pi = 0;
+    let mut vi = 0;
+    let mut star_pi = usize::MAX;
+    let mut star_vi = 0;
+
+    while vi < value.len() {
+        if pi < pattern.len() && pattern[pi] == '%' {
+            star_pi = pi;
+            star_vi = vi;
+            pi += 1;
+        } else if pi < pattern.len()
+            && (pattern[pi] == '_'
+                || pattern[pi].to_ascii_lowercase() == value[vi].to_ascii_lowercase())
+        {
+            pi += 1;
+            vi += 1;
+        } else if star_pi != usize::MAX {
+            pi = star_pi + 1;
+            star_vi += 1;
+            vi = star_vi;
+        } else {
+            return false;
+        }
+    }
+
+    while pi < pattern.len() && pattern[pi] == '%' {
+        pi += 1;
+    }
+    pi == pattern.len()
+}
+
+fn eval_cast(val: Value, type_name: &str) -> Result<Value> {
+    if matches!(val, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let upper = type_name.to_uppercase();
+    if upper.contains("INT") {
+        match &val {
+            Value::Integer(_) => Ok(val),
+            Value::Real(f) => Ok(Value::Integer(*f as i64)),
+            Value::Text(s) => {
+                let n = s.trim().parse::<i64>().unwrap_or(0);
+                Ok(Value::Integer(n))
+            }
+            Value::Blob(b) => {
+                let s = String::from_utf8_lossy(b);
+                let n = s.trim().parse::<i64>().unwrap_or(0);
+                Ok(Value::Integer(n))
+            }
+            Value::Null => Ok(Value::Null),
+        }
+    } else if upper.contains("REAL") || upper.contains("FLOAT") || upper.contains("DOUBLE") {
+        match &val {
+            Value::Real(_) => Ok(val),
+            Value::Integer(n) => Ok(Value::Real(*n as f64)),
+            Value::Text(s) => {
+                let f = s.trim().parse::<f64>().unwrap_or(0.0);
+                Ok(Value::Real(f))
+            }
+            _ => Ok(Value::Real(0.0)),
+        }
+    } else if upper.contains("TEXT") || upper.contains("CHAR") || upper.contains("CLOB") {
+        Ok(Value::Text(value_to_text(&val)))
+    } else if upper.contains("BLOB") {
+        match val {
+            Value::Blob(_) => Ok(val),
+            Value::Text(s) => Ok(Value::Blob(s.into_bytes())),
+            _ => Ok(Value::Blob(value_to_text(&val).into_bytes())),
+        }
+    } else {
+        Ok(val)
+    }
+}
+
 fn rand_i64() -> i64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -1816,6 +1963,14 @@ fn eval_binop(op: BinOp, left: &Value, right: &Value) -> Result<Value> {
         }
         BinOp::Mod => {
             numeric_op(left, right, |a, b| if b != 0 { a % b } else { 0 }, |a, b| a % b)
+        }
+        BinOp::Concat => {
+            if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let l = value_to_text(left);
+            let r = value_to_text(right);
+            Ok(Value::Text(format!("{l}{r}")))
         }
     }
 }

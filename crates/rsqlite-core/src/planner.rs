@@ -186,6 +186,25 @@ pub enum PlanExpr {
         name: String,
         args: Vec<PlanExpr>,
     },
+    Like {
+        expr: Box<PlanExpr>,
+        pattern: Box<PlanExpr>,
+        negated: bool,
+    },
+    InList {
+        expr: Box<PlanExpr>,
+        list: Vec<PlanExpr>,
+        negated: bool,
+    },
+    Case {
+        operand: Option<Box<PlanExpr>>,
+        when_clauses: Vec<(PlanExpr, PlanExpr)>,
+        else_result: Option<Box<PlanExpr>>,
+    },
+    Cast {
+        expr: Box<PlanExpr>,
+        type_name: String,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -212,6 +231,7 @@ pub enum BinOp {
     Mul,
     Div,
     Mod,
+    Concat,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -667,6 +687,122 @@ fn plan_expr(expr: &Expr, columns: &[ColumnRef]) -> Result<PlanExpr> {
                 args,
             })
         }
+        Expr::Like {
+            negated,
+            expr: like_expr,
+            pattern,
+            ..
+        } => {
+            let e = plan_expr(like_expr, columns)?;
+            let p = plan_expr(pattern, columns)?;
+            Ok(PlanExpr::Like {
+                expr: Box::new(e),
+                pattern: Box::new(p),
+                negated: *negated,
+            })
+        }
+        Expr::ILike {
+            negated,
+            expr: like_expr,
+            pattern,
+            ..
+        } => {
+            let e = plan_expr(like_expr, columns)?;
+            let p = plan_expr(pattern, columns)?;
+            Ok(PlanExpr::Like {
+                expr: Box::new(e),
+                pattern: Box::new(p),
+                negated: *negated,
+            })
+        }
+        Expr::Between {
+            expr: between_expr,
+            negated,
+            low,
+            high,
+        } => {
+            let e = plan_expr(between_expr, columns)?;
+            let lo = plan_expr(low, columns)?;
+            let hi = plan_expr(high, columns)?;
+            let gte = PlanExpr::BinaryOp {
+                left: Box::new(e.clone()),
+                op: BinOp::GtEq,
+                right: Box::new(lo),
+            };
+            let lte = PlanExpr::BinaryOp {
+                left: Box::new(e),
+                op: BinOp::LtEq,
+                right: Box::new(hi),
+            };
+            let combined = PlanExpr::BinaryOp {
+                left: Box::new(gte),
+                op: BinOp::And,
+                right: Box::new(lte),
+            };
+            if *negated {
+                Ok(PlanExpr::UnaryOp {
+                    op: UnaryOp::Not,
+                    operand: Box::new(combined),
+                })
+            } else {
+                Ok(combined)
+            }
+        }
+        Expr::InList {
+            expr: in_expr,
+            list,
+            negated,
+        } => {
+            let e = plan_expr(in_expr, columns)?;
+            let items = list
+                .iter()
+                .map(|item| plan_expr(item, columns))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(PlanExpr::InList {
+                expr: Box::new(e),
+                list: items,
+                negated: *negated,
+            })
+        }
+        Expr::Case {
+            operand,
+            conditions,
+            else_result,
+        } => {
+            let op = operand
+                .as_ref()
+                .map(|e| plan_expr(e, columns))
+                .transpose()?;
+            let when_clauses = conditions
+                .iter()
+                .map(|cw| {
+                    let cond = plan_expr(&cw.condition, columns)?;
+                    let result = plan_expr(&cw.result, columns)?;
+                    Ok((cond, result))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let else_r = else_result
+                .as_ref()
+                .map(|e| plan_expr(e, columns))
+                .transpose()?;
+            Ok(PlanExpr::Case {
+                operand: op.map(Box::new),
+                when_clauses,
+                else_result: else_r.map(Box::new),
+            })
+        }
+        Expr::Cast {
+            expr: cast_expr,
+            data_type,
+            ..
+        } => {
+            let e = plan_expr(cast_expr, columns)?;
+            let type_name = data_type.to_string().to_uppercase();
+            Ok(PlanExpr::Cast {
+                expr: Box::new(e),
+                type_name,
+            })
+        }
         _ => Err(Error::Other(format!(
             "unsupported expression: {expr}"
         ))),
@@ -799,6 +935,7 @@ fn plan_binop(op: &ast::BinaryOperator) -> Result<BinOp> {
         ast::BinaryOperator::Multiply => Ok(BinOp::Mul),
         ast::BinaryOperator::Divide => Ok(BinOp::Div),
         ast::BinaryOperator::Modulo => Ok(BinOp::Mod),
+        ast::BinaryOperator::StringConcat => Ok(BinOp::Concat),
         _ => Err(Error::Other(format!("unsupported operator: {op}"))),
     }
 }
@@ -873,6 +1010,26 @@ fn contains_aggregate(expr: &PlanExpr) -> bool {
         PlanExpr::UnaryOp { operand, .. } => contains_aggregate(operand),
         PlanExpr::IsNull(inner) | PlanExpr::IsNotNull(inner) => contains_aggregate(inner),
         PlanExpr::Function { args, .. } => args.iter().any(contains_aggregate),
+        PlanExpr::Like { expr, pattern, .. } => {
+            contains_aggregate(expr) || contains_aggregate(pattern)
+        }
+        PlanExpr::InList { expr, list, .. } => {
+            contains_aggregate(expr) || list.iter().any(contains_aggregate)
+        }
+        PlanExpr::Case {
+            operand,
+            when_clauses,
+            else_result,
+        } => {
+            operand.as_ref().is_some_and(|e| contains_aggregate(e))
+                || when_clauses
+                    .iter()
+                    .any(|(c, r)| contains_aggregate(c) || contains_aggregate(r))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| contains_aggregate(e))
+        }
+        PlanExpr::Cast { expr, .. } => contains_aggregate(expr),
         PlanExpr::Column(_) | PlanExpr::Rowid | PlanExpr::Literal(_) | PlanExpr::Wildcard => false,
     }
 }
