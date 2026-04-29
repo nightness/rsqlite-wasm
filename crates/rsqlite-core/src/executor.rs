@@ -8,8 +8,8 @@ use rsqlite_storage::pager::Pager;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::planner::{
-    BinOp, ColumnRef, CreateTablePlan, DeletePlan, InsertPlan, LiteralValue, Plan, PlanExpr,
-    ProjectionItem, SortKey, UnaryOp, UpdatePlan,
+    BinOp, ColumnRef, CreateTablePlan, DeletePlan, InsertPlan, JoinType, LiteralValue, Plan,
+    PlanExpr, ProjectionItem, SortKey, UnaryOp, UpdatePlan,
 };
 use crate::types::{QueryResult, Row};
 
@@ -79,6 +79,12 @@ pub fn execute(plan: &Plan, pager: &mut Pager) -> Result<QueryResult> {
                 rows: unique_rows,
             })
         }
+        Plan::NestedLoopJoin {
+            left,
+            right,
+            condition,
+            join_type,
+        } => execute_join(left, right, condition.as_ref(), *join_type, pager),
         Plan::CreateTable(_)
         | Plan::Insert(_)
         | Plan::Update(_)
@@ -456,7 +462,16 @@ fn execute_scan(
     columns: &[ColumnRef],
     pager: &mut Pager,
 ) -> Result<QueryResult> {
-    let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let column_names: Vec<String> = columns
+        .iter()
+        .map(|c| {
+            if let Some(t) = &c.table {
+                format!("{}.{}", t, c.name)
+            } else {
+                c.name.clone()
+            }
+        })
+        .collect();
 
     let mut cursor = BTreeCursor::new(pager, root_page);
     let btree_rows = cursor.collect_all().map_err(|e| Error::Other(e.to_string()))?;
@@ -515,18 +530,100 @@ fn execute_project(
     })
 }
 
+fn execute_join(
+    left: &Plan,
+    right: &Plan,
+    condition: Option<&PlanExpr>,
+    join_type: JoinType,
+    pager: &mut Pager,
+) -> Result<QueryResult> {
+    let left_result = execute(left, pager)?;
+    let right_result = execute(right, pager)?;
+
+    let combined_columns: Vec<String> = left_result
+        .columns
+        .iter()
+        .chain(right_result.columns.iter())
+        .cloned()
+        .collect();
+
+    let right_width = right_result.columns.len();
+    let null_right = vec![Value::Null; right_width];
+
+    let mut rows = Vec::new();
+
+    for left_row in &left_result.rows {
+        let mut matched = false;
+
+        for right_row in &right_result.rows {
+            let mut combined_values = left_row.values.clone();
+            combined_values.extend_from_slice(&right_row.values);
+            let combined_row = Row {
+                values: combined_values,
+            };
+
+            let passes = match condition {
+                Some(cond) => {
+                    let val = eval_expr(cond, &combined_row, &combined_columns)?;
+                    is_truthy(&val)
+                }
+                None => true,
+            };
+
+            if passes {
+                matched = true;
+                rows.push(combined_row);
+            }
+        }
+
+        if join_type == JoinType::Left && !matched {
+            let mut combined_values = left_row.values.clone();
+            combined_values.extend_from_slice(&null_right);
+            rows.push(Row {
+                values: combined_values,
+            });
+        }
+    }
+
+    Ok(QueryResult {
+        columns: combined_columns,
+        rows,
+    })
+}
+
 fn eval_expr(expr: &PlanExpr, row: &Row, columns: &[String]) -> Result<Value> {
     match expr {
         PlanExpr::Column(col_ref) => {
-            let idx = columns
-                .iter()
-                .position(|c| c.eq_ignore_ascii_case(&col_ref.name))
-                .ok_or_else(|| {
-                    Error::Other(format!(
-                        "column not found in row: {}",
-                        col_ref.name
-                    ))
-                })?;
+            let qualified = col_ref
+                .table
+                .as_ref()
+                .map(|t| format!("{}.{}", t, col_ref.name));
+
+            let idx = if let Some(ref qname) = qualified {
+                columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(qname))
+            } else {
+                None
+            }
+            .or_else(|| {
+                columns
+                    .iter()
+                    .position(|c| c.eq_ignore_ascii_case(&col_ref.name))
+            })
+            .or_else(|| {
+                columns.iter().position(|c| {
+                    c.rsplit('.').next().is_some_and(|suffix| {
+                        suffix.eq_ignore_ascii_case(&col_ref.name)
+                    })
+                })
+            })
+            .ok_or_else(|| {
+                Error::Other(format!(
+                    "column not found in row: {}",
+                    qualified.as_deref().unwrap_or(&col_ref.name)
+                ))
+            })?;
             Ok(row.values.get(idx).cloned().unwrap_or(Value::Null))
         }
         PlanExpr::Rowid => {

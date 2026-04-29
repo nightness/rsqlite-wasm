@@ -45,6 +45,13 @@ pub struct DeletePlan {
     pub predicate: Option<PlanExpr>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JoinType {
+    Inner,
+    Left,
+    Cross,
+}
+
 #[derive(Debug, Clone)]
 pub struct SortKey {
     pub expr: PlanExpr,
@@ -79,6 +86,12 @@ pub enum Plan {
     Distinct {
         input: Box<Plan>,
     },
+    NestedLoopJoin {
+        left: Box<Plan>,
+        right: Box<Plan>,
+        condition: Option<PlanExpr>,
+        join_type: JoinType,
+    },
     CreateTable(CreateTablePlan),
     Insert(InsertPlan),
     Update(UpdatePlan),
@@ -93,6 +106,7 @@ pub struct ColumnRef {
     pub name: String,
     pub column_index: usize,
     pub is_rowid_alias: bool,
+    pub table: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,6 +191,47 @@ pub fn plan_query(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
     plan_statement(stmt, catalog)
 }
 
+fn resolve_table_factor(
+    relation: &TableFactor,
+    catalog: &Catalog,
+) -> Result<(Plan, Vec<ColumnRef>)> {
+    match relation {
+        TableFactor::Table { name, alias, .. } => {
+            let table_name = name.to_string();
+            let table_def = catalog.get_table(&table_name).ok_or_else(|| {
+                Error::Other(format!("table not found: {table_name}"))
+            })?;
+
+            let prefix = alias
+                .as_ref()
+                .map(|a| a.name.value.clone())
+                .unwrap_or_else(|| table_name.clone());
+
+            let columns: Vec<ColumnRef> = table_def
+                .columns
+                .iter()
+                .map(|c| ColumnRef {
+                    name: c.name.clone(),
+                    column_index: c.column_index,
+                    is_rowid_alias: c.is_rowid_alias,
+                    table: Some(prefix.clone()),
+                })
+                .collect();
+
+            let plan = Plan::Scan {
+                table: table_name,
+                root_page: table_def.root_page,
+                columns: columns.clone(),
+            };
+
+            Ok((plan, columns))
+        }
+        _ => Err(Error::Other(
+            "only simple table references are supported".to_string(),
+        )),
+    }
+}
+
 fn plan_select(query: &ast::Query, catalog: &Catalog) -> Result<Plan> {
     let select = match query.body.as_ref() {
         SetExpr::Select(s) => s,
@@ -187,41 +242,93 @@ fn plan_select(query: &ast::Query, catalog: &Catalog) -> Result<Plan> {
         }
     };
 
-    if select.from.len() != 1 {
+    if select.from.is_empty() {
         return Err(Error::Other(
-            "exactly one table in FROM is required".to_string(),
+            "at least one table in FROM is required".to_string(),
         ));
     }
 
+    // Build plan from FROM clause (first item + its joins)
     let from = &select.from[0];
-    let table_name = match &from.relation {
-        TableFactor::Table { name, .. } => name.to_string(),
-        _ => {
-            return Err(Error::Other(
-                "only simple table references are supported".to_string(),
-            ))
+    let (mut plan, mut all_columns) = resolve_table_factor(&from.relation, catalog)?;
+
+    // Handle explicit JOINs
+    for join in &from.joins {
+        let (right_plan, right_columns) = resolve_table_factor(&join.relation, catalog)?;
+        let combined_columns: Vec<ColumnRef> =
+            all_columns.iter().chain(right_columns.iter()).cloned().collect();
+
+        let (join_type, condition) = match &join.join_operator {
+            ast::JoinOperator::Inner(constraint) | ast::JoinOperator::Join(constraint) => {
+                let cond = plan_join_constraint(constraint, &combined_columns)?;
+                (JoinType::Inner, cond)
+            }
+            ast::JoinOperator::Left(constraint) | ast::JoinOperator::LeftOuter(constraint) => {
+                let cond = plan_join_constraint(constraint, &combined_columns)?;
+                (JoinType::Left, cond)
+            }
+            ast::JoinOperator::CrossJoin => (JoinType::Cross, None),
+            _ => {
+                return Err(Error::Other(
+                    "only INNER, LEFT, and CROSS JOIN are supported".to_string(),
+                ))
+            }
+        };
+
+        plan = Plan::NestedLoopJoin {
+            left: Box::new(plan),
+            right: Box::new(right_plan),
+            condition,
+            join_type,
+        };
+        all_columns = combined_columns;
+    }
+
+    // Handle implicit cross-joins (multiple comma-separated tables)
+    for extra_from in &select.from[1..] {
+        let (right_plan, right_columns) = resolve_table_factor(&extra_from.relation, catalog)?;
+        let combined_columns: Vec<ColumnRef> =
+            all_columns.iter().chain(right_columns.iter()).cloned().collect();
+
+        plan = Plan::NestedLoopJoin {
+            left: Box::new(plan),
+            right: Box::new(right_plan),
+            condition: None,
+            join_type: JoinType::Cross,
+        };
+        all_columns = combined_columns;
+
+        for join in &extra_from.joins {
+            let (right_plan, right_cols) = resolve_table_factor(&join.relation, catalog)?;
+            let combined: Vec<ColumnRef> =
+                all_columns.iter().chain(right_cols.iter()).cloned().collect();
+
+            let (join_type, condition) = match &join.join_operator {
+                ast::JoinOperator::Inner(c) | ast::JoinOperator::Join(c) => {
+                    let cond = plan_join_constraint(c, &combined)?;
+                    (JoinType::Inner, cond)
+                }
+                ast::JoinOperator::Left(c) | ast::JoinOperator::LeftOuter(c) => {
+                    let cond = plan_join_constraint(c, &combined)?;
+                    (JoinType::Left, cond)
+                }
+                ast::JoinOperator::CrossJoin => (JoinType::Cross, None),
+                _ => {
+                    return Err(Error::Other(
+                        "only INNER, LEFT, and CROSS JOIN are supported".to_string(),
+                    ))
+                }
+            };
+
+            plan = Plan::NestedLoopJoin {
+                left: Box::new(plan),
+                right: Box::new(right_plan),
+                condition,
+                join_type,
+            };
+            all_columns = combined;
         }
-    };
-
-    let table_def = catalog.get_table(&table_name).ok_or_else(|| {
-        Error::Other(format!("table not found: {table_name}"))
-    })?;
-
-    let all_columns: Vec<ColumnRef> = table_def
-        .columns
-        .iter()
-        .map(|c| ColumnRef {
-            name: c.name.clone(),
-            column_index: c.column_index,
-            is_rowid_alias: c.is_rowid_alias,
-        })
-        .collect();
-
-    let mut plan = Plan::Scan {
-        table: table_name.clone(),
-        root_page: table_def.root_page,
-        columns: all_columns.clone(),
-    };
+    }
 
     // WHERE clause -> Filter
     if let Some(selection) = &select.selection {
@@ -347,6 +454,27 @@ fn plan_expr(expr: &Expr, columns: &[ColumnRef]) -> Result<PlanExpr> {
                 .ok_or_else(|| Error::Other(format!("unknown column: {name}")))?;
             Ok(PlanExpr::Column(col.clone()))
         }
+        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
+            let table = &parts[0].value;
+            let col_name = &parts[1].value;
+            let col = columns
+                .iter()
+                .find(|c| {
+                    c.name.eq_ignore_ascii_case(col_name)
+                        && c.table
+                            .as_ref()
+                            .is_some_and(|t| t.eq_ignore_ascii_case(table))
+                })
+                .or_else(|| {
+                    columns
+                        .iter()
+                        .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                })
+                .ok_or_else(|| {
+                    Error::Other(format!("unknown column: {table}.{col_name}"))
+                })?;
+            Ok(PlanExpr::Column(col.clone()))
+        }
         Expr::Value(val) => Ok(PlanExpr::Literal(plan_value(&val.value)?)),
         Expr::BinaryOp { left, op, right } => {
             let left = plan_expr(left, columns)?;
@@ -447,6 +575,7 @@ fn plan_order_expr(
                 name: name.clone(),
                 column_index: 0,
                 is_rowid_alias: false,
+                table: None,
             };
             return Ok(PlanExpr::Column(col_ref));
         }
@@ -467,6 +596,22 @@ fn plan_limit_expr(expr: &Expr) -> Result<u64> {
         _ => Err(Error::Other(format!(
             "LIMIT/OFFSET must be a literal, got: {expr}"
         ))),
+    }
+}
+
+fn plan_join_constraint(
+    constraint: &ast::JoinConstraint,
+    columns: &[ColumnRef],
+) -> Result<Option<PlanExpr>> {
+    match constraint {
+        ast::JoinConstraint::On(expr) => {
+            let planned = plan_expr(expr, columns)?;
+            Ok(Some(planned))
+        }
+        ast::JoinConstraint::None | ast::JoinConstraint::Natural => Ok(None),
+        ast::JoinConstraint::Using(_) => Err(Error::Other(
+            "USING clause not yet supported".to_string(),
+        )),
     }
 }
 
@@ -547,6 +692,7 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
             name: c.name.clone(),
             column_index: c.column_index,
             is_rowid_alias: c.is_rowid_alias,
+            table: None,
         })
         .collect();
 
@@ -620,6 +766,7 @@ fn plan_update(
             name: c.name.clone(),
             column_index: c.column_index,
             is_rowid_alias: c.is_rowid_alias,
+            table: None,
         })
         .collect();
 
@@ -681,6 +828,7 @@ fn plan_delete(delete: &ast::Delete, catalog: &Catalog) -> Result<Plan> {
             name: c.name.clone(),
             column_index: c.column_index,
             is_rowid_alias: c.is_rowid_alias,
+            table: None,
         })
         .collect();
 

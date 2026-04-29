@@ -901,4 +901,142 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    #[test]
+    fn inner_join() {
+        let db_path = "/tmp/rsqlite_db_inner_join.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, product TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie')").unwrap();
+
+        db.execute("INSERT INTO orders VALUES (1, 1, 'Widget')").unwrap();
+        db.execute("INSERT INTO orders VALUES (2, 1, 'Gadget')").unwrap();
+        db.execute("INSERT INTO orders VALUES (3, 2, 'Doohickey')").unwrap();
+
+        let result = db
+            .query(
+                "SELECT users.name, orders.product FROM users \
+                 INNER JOIN orders ON users.id = orders.user_id \
+                 ORDER BY orders.product",
+            )
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 3);
+        use rsqlite_storage::codec::Value;
+        assert_eq!(result.rows[0].values[1], Value::Text("Doohickey".to_string()));
+        assert_eq!(result.rows[0].values[0], Value::Text("Bob".to_string()));
+        assert_eq!(result.rows[1].values[1], Value::Text("Gadget".to_string()));
+        assert_eq!(result.rows[1].values[0], Value::Text("Alice".to_string()));
+        assert_eq!(result.rows[2].values[1], Value::Text("Widget".to_string()));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn left_join() {
+        let db_path = "/tmp/rsqlite_db_left_join.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, product TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO users VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO users VALUES (2, 'Bob')").unwrap();
+        db.execute("INSERT INTO users VALUES (3, 'Charlie')").unwrap();
+
+        db.execute("INSERT INTO orders VALUES (1, 1, 'Widget')").unwrap();
+
+        let result = db
+            .query(
+                "SELECT users.name, orders.product FROM users \
+                 LEFT JOIN orders ON users.id = orders.user_id \
+                 ORDER BY users.name",
+            )
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 3);
+        use rsqlite_storage::codec::Value;
+        // Alice has an order
+        assert_eq!(result.rows[0].values[0], Value::Text("Alice".to_string()));
+        assert_eq!(result.rows[0].values[1], Value::Text("Widget".to_string()));
+        // Bob has no order
+        assert_eq!(result.rows[1].values[0], Value::Text("Bob".to_string()));
+        assert_eq!(result.rows[1].values[1], Value::Null);
+        // Charlie has no order
+        assert_eq!(result.rows[2].values[0], Value::Text("Charlie".to_string()));
+        assert_eq!(result.rows[2].values[1], Value::Null);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn cross_join() {
+        let db_path = "/tmp/rsqlite_db_cross_join.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, y TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO a VALUES (1, 'a1')").unwrap();
+        db.execute("INSERT INTO a VALUES (2, 'a2')").unwrap();
+        db.execute("INSERT INTO b VALUES (1, 'b1')").unwrap();
+        db.execute("INSERT INTO b VALUES (2, 'b2')").unwrap();
+        db.execute("INSERT INTO b VALUES (3, 'b3')").unwrap();
+
+        let result = db
+            .query("SELECT a.x, b.y FROM a CROSS JOIN b")
+            .unwrap();
+
+        // 2 * 3 = 6 rows
+        assert_eq!(result.rows.len(), 6);
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn implicit_cross_join() {
+        let db_path = "/tmp/rsqlite_db_implicit_cross.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE b (id INTEGER PRIMARY KEY, y TEXT)")
+            .unwrap();
+
+        db.execute("INSERT INTO a VALUES (1, 'a1')").unwrap();
+        db.execute("INSERT INTO a VALUES (2, 'a2')").unwrap();
+        db.execute("INSERT INTO b VALUES (1, 'b1')").unwrap();
+        db.execute("INSERT INTO b VALUES (2, 'b2')").unwrap();
+
+        let result = db
+            .query("SELECT a.x, b.y FROM a, b WHERE a.id = b.id")
+            .unwrap();
+
+        assert_eq!(result.rows.len(), 2);
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }
