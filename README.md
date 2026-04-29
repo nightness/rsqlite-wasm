@@ -151,6 +151,53 @@ rsqlite-wasm ------> rsqlite-core
 
 The core engine uses a **tree-walking interpreter** with a Volcano/iterator execution model. The query planner produces logical plans that the executor evaluates directly — no bytecode VM. This keeps the WASM binary small and the code easy to debug.
 
+## Vector Search (Non-Standard Extension)
+
+rsqlite-wasm includes built-in vector similarity search functions. These are **not part of the SQL standard or SQLite** — they are custom extensions inspired by [sqlite-vec](https://github.com/asg017/sqlite-vec) and similar projects.
+
+### Storage format
+
+Vectors are stored as plain BLOBs: `N` float32 values in **little-endian** byte order, giving `4 * N` bytes per vector. A 384-dimension embedding (typical for models like all-MiniLM-L6-v2) is a 1,536-byte BLOB.
+
+```sql
+CREATE TABLE embeddings (
+  id INTEGER PRIMARY KEY,
+  text TEXT,
+  vector BLOB
+);
+```
+
+### Functions
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `vec_distance_cosine(a, b)` | `(BLOB, BLOB) -> REAL` | Cosine distance (1 - cosine similarity). 0 = identical. |
+| `vec_distance_l2(a, b)` | `(BLOB, BLOB) -> REAL` | Euclidean (L2) distance. 0 = identical. |
+| `vec_distance_dot(a, b)` | `(BLOB, BLOB) -> REAL` | Negative dot product. Lower = more similar. |
+| `vec_length(a)` | `(BLOB) -> INTEGER` | Number of dimensions (`byte_length / 4`). |
+| `vec_normalize(a)` | `(BLOB) -> BLOB` | Returns L2-normalized copy of the vector. |
+| `vec_from_json(text)` | `(TEXT) -> BLOB` | Parses a JSON array like `[0.1, 0.2, ...]` into a vector BLOB. |
+| `vec_to_json(blob)` | `(BLOB) -> TEXT` | Serializes a vector BLOB back to a JSON array. |
+
+### KNN query pattern
+
+Search is brute-force (no approximate nearest neighbor index). This is suitable for PWA-scale workloads — thousands to low tens-of-thousands of rows.
+
+```sql
+-- Insert via JSON (or bind a BLOB parameter directly)
+INSERT INTO embeddings VALUES (1, 'hello world', vec_from_json('[0.1, 0.2, 0.3, ...]'));
+
+-- K-nearest-neighbor search
+SELECT id, text, vec_distance_cosine(vector, vec_from_json(?)) AS distance
+FROM embeddings
+ORDER BY distance
+LIMIT 10;
+```
+
+### Portability note
+
+Vector BLOBs are ordinary SQLite BLOB values — they will survive export/import with the `sqlite3` CLI. However, the `vec_*` functions only exist in rsqlite-wasm, so queries that use them will not work in standard SQLite.
+
 ## License
 
 [MIT](LICENSE)
