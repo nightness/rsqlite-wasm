@@ -353,6 +353,9 @@ fn resolve_table_factor(
                         column_index: i,
                         is_rowid_alias: false,
                         table: Some(prefix.clone()),
+                        nullable: true,
+                        is_primary_key: false,
+                        is_unique: false,
                     })
                     .collect();
 
@@ -373,6 +376,9 @@ fn resolve_table_factor(
                         column_index: c.column_index,
                         is_rowid_alias: c.is_rowid_alias,
                         table: Some(prefix.clone()),
+                        nullable: c.nullable,
+                        is_primary_key: c.is_primary_key,
+                        is_unique: c.is_unique,
                     })
                     .collect();
 
@@ -424,6 +430,9 @@ fn resolve_view(
                     column_index: i,
                     is_rowid_alias: false,
                     table: Some(prefix.clone()),
+                    nullable: true,
+                    is_primary_key: false,
+                    is_unique: false,
                 })
                 .collect();
 
@@ -461,6 +470,9 @@ fn rewrite_window_refs(expr: &PlanExpr, win_idx: &mut usize, base_col_offset: us
                 column_index: base_col_offset + idx,
                 is_rowid_alias: false,
                 table: None,
+                nullable: true,
+                is_primary_key: false,
+                is_unique: false,
             })
         }
         PlanExpr::BinaryOp { left, op, right } => PlanExpr::BinaryOp {
@@ -535,6 +547,9 @@ fn plan_select(query: &ast::Query, catalog: &Catalog, parent_ctes: &CteMap) -> R
                                 column_index: i,
                                 is_rowid_alias: false,
                                 table: None,
+                                nullable: true,
+                                is_primary_key: false,
+                                is_unique: false,
                             }),
                             alias: alias.clone(),
                         }
@@ -1305,6 +1320,9 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
             column_index: c.column_index,
             is_rowid_alias: c.is_rowid_alias,
             table: None,
+            nullable: c.nullable,
+            is_primary_key: c.is_primary_key,
+            is_unique: c.is_unique,
         })
         .collect();
 
@@ -1414,6 +1432,9 @@ fn plan_update(
             column_index: c.column_index,
             is_rowid_alias: c.is_rowid_alias,
             table: None,
+            nullable: c.nullable,
+            is_primary_key: c.is_primary_key,
+            is_unique: c.is_unique,
         })
         .collect();
 
@@ -1476,6 +1497,9 @@ fn plan_delete(delete: &ast::Delete, catalog: &Catalog) -> Result<Plan> {
             column_index: c.column_index,
             is_rowid_alias: c.is_rowid_alias,
             table: None,
+            nullable: c.nullable,
+            is_primary_key: c.is_primary_key,
+            is_unique: c.is_unique,
         })
         .collect();
 

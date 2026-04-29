@@ -45,6 +45,7 @@ pub struct ColumnDef {
     pub is_primary_key: bool,
     pub is_rowid_alias: bool,
     pub nullable: bool,
+    pub is_unique: bool,
     pub column_index: usize,
 }
 
@@ -204,6 +205,10 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 matches!(opt.option, ColumnOption::NotNull)
             }) && !is_primary_key;
 
+            let is_unique = col.options.iter().any(|opt| {
+                matches!(opt.option, ColumnOption::Unique { is_primary: false, .. })
+            }) || is_primary_key;
+
             columns.push(ColumnDef {
                 name: col.name.value.clone(),
                 type_name: type_name.clone(),
@@ -211,6 +216,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 is_primary_key,
                 is_rowid_alias,
                 nullable,
+                is_unique,
                 column_index: i,
             });
         }

@@ -3990,3 +3990,120 @@
         let r = db.query(r#"SELECT json_patch('{"a":1,"b":2}', '{"a":null}')"#).unwrap();
         assert_eq!(r.rows[0].values[0], crate::types::Value::Text(r#"{"b":2}"#.into()));
     }
+
+    // ───────────────────── NOT NULL constraint tests ─────────────────────
+
+    #[test]
+    fn not_null_insert_violation() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        let r = db.execute("INSERT INTO t (id) VALUES (1)");
+        assert!(r.is_err());
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("NOT NULL"), "Expected NOT NULL error, got: {err}");
+    }
+
+    #[test]
+    fn not_null_insert_explicit_null() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        let r = db.execute("INSERT INTO t VALUES (1, NULL)");
+        assert!(r.is_err());
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("NOT NULL"), "Expected NOT NULL error, got: {err}");
+    }
+
+    #[test]
+    fn not_null_insert_valid() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        let r = db.query("SELECT name FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("Alice".into()));
+    }
+
+    #[test]
+    fn not_null_update_violation() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Alice')").unwrap();
+        let r = db.execute("UPDATE t SET name = NULL WHERE id = 1");
+        assert!(r.is_err());
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("NOT NULL"), "Expected NOT NULL error, got: {err}");
+    }
+
+    #[test]
+    fn not_null_nullable_column_allows_null() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, email TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, NULL, NULL)").unwrap();
+        let r = db.query("SELECT name, email FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Null);
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Null);
+    }
+
+    // ───────────────────── UNIQUE constraint tests ─────────────────────
+
+    #[test]
+    fn unique_insert_violation() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alice@test.com')").unwrap();
+        let r = db.execute("INSERT INTO t VALUES (2, 'alice@test.com')");
+        assert!(r.is_err());
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("UNIQUE"), "Expected UNIQUE error, got: {err}");
+    }
+
+    #[test]
+    fn unique_insert_different_values_ok() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alice@test.com')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'bob@test.com')").unwrap();
+        let r = db.query("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(2));
+    }
+
+    #[test]
+    fn unique_null_allowed_multiple() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, NULL)").unwrap();
+        let r = db.query("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(2));
+    }
+
+    #[test]
+    fn unique_update_violation() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alice@test.com')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'bob@test.com')").unwrap();
+        let r = db.execute("UPDATE t SET email = 'alice@test.com' WHERE id = 2");
+        assert!(r.is_err());
+        let err = r.unwrap_err().to_string();
+        assert!(err.contains("UNIQUE"), "Expected UNIQUE error, got: {err}");
+    }
+
+    #[test]
+    fn unique_update_same_row_ok() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alice@test.com')").unwrap();
+        db.execute("UPDATE t SET email = 'alice@test.com' WHERE id = 1").unwrap();
+        let r = db.query("SELECT email FROM t").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Text("alice@test.com".into()));
+    }

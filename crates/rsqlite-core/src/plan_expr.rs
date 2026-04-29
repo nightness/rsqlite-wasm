@@ -15,6 +15,9 @@ pub struct ColumnRef {
     pub column_index: usize,
     pub is_rowid_alias: bool,
     pub table: Option<String>,
+    pub nullable: bool,
+    pub is_primary_key: bool,
+    pub is_unique: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +663,9 @@ pub(super) fn plan_order_expr(
                         column_index: 0,
                         is_rowid_alias: false,
                         table: None,
+                        nullable: true,
+                        is_primary_key: false,
+                        is_unique: false,
                     }));
                 }
             }
@@ -682,6 +688,9 @@ pub(super) fn plan_order_expr(
                 column_index: 0,
                 is_rowid_alias: false,
                 table: None,
+                nullable: true,
+                is_primary_key: false,
+                is_unique: false,
             };
             return Ok(PlanExpr::Column(col_ref));
         }

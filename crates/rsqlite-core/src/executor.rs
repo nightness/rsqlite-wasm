@@ -932,6 +932,8 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
                 None => btree_max_rowid(pager, current_root)? + 1,
             };
 
+            check_not_null_constraints(&values, &plan.table_columns, &plan.table_name)?;
+            check_unique_constraints(&values, &plan.table_columns, &plan.table_name, pager, current_root, None)?;
             let record = Record { values: values.clone() };
             current_root = btree_insert(pager, current_root, rowid, &record)?;
             for (idx_root, idx_col_indices) in &table_indexes {
@@ -1038,6 +1040,8 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
             }
         }
 
+        check_not_null_constraints(&values, &plan.table_columns, &plan.table_name)?;
+        check_unique_constraints(&values, &plan.table_columns, &plan.table_name, pager, current_root, None)?;
         let record = Record {
             values: values.clone(),
         };
@@ -1060,6 +1064,64 @@ fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Catalog) -> Re
     set_last_insert_rowid(last_rowid);
     set_changes(rows_affected as i64);
     Ok(ExecResult { rows_affected })
+}
+
+fn check_not_null_constraints(values: &[Value], columns: &[ColumnRef], table_name: &str) -> Result<()> {
+    for (i, col) in columns.iter().enumerate() {
+        if !col.nullable && !col.is_rowid_alias {
+            if let Some(Value::Null) = values.get(i) {
+                return Err(Error::Other(format!(
+                    "NOT NULL constraint failed: {}.{}", table_name, col.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_unique_constraints(
+    values: &[Value],
+    columns: &[ColumnRef],
+    table_name: &str,
+    pager: &mut Pager,
+    root_page: u32,
+    exclude_rowid: Option<i64>,
+) -> Result<()> {
+    let unique_cols: Vec<(usize, &str)> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.is_unique && !c.is_rowid_alias)
+        .map(|(i, c)| (i, c.name.as_str()))
+        .collect();
+
+    if unique_cols.is_empty() {
+        return Ok(());
+    }
+
+    let mut cursor = BTreeCursor::new(pager, root_page);
+    let rows = cursor.collect_all().map_err(|e| Error::Other(e.to_string()))?;
+
+    for (col_idx, col_name) in &unique_cols {
+        let new_val = &values[*col_idx];
+        if matches!(new_val, Value::Null) {
+            continue;
+        }
+        for row in &rows {
+            if let Some(exclude) = exclude_rowid {
+                if row.rowid == exclude {
+                    continue;
+                }
+            }
+            if let Some(existing) = row.record.values.get(*col_idx) {
+                if compare(existing, new_val) == 0 {
+                    return Err(Error::Other(format!(
+                        "UNIQUE constraint failed: {}.{}", table_name, col_name
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn map_query_row_to_insert(
@@ -1389,6 +1451,8 @@ fn execute_update(plan: &UpdatePlan, pager: &mut Pager, catalog: &Catalog) -> Re
                     })?;
                 new_values[col_idx] = eval_expr(expr, &row, &column_names, pager, catalog)?;
             }
+            check_not_null_constraints(&new_values, &plan.table_columns, &plan.table_name)?;
+            check_unique_constraints(&new_values, &plan.table_columns, &plan.table_name, pager, plan.root_page, Some(btree_row.rowid))?;
             to_update.push((btree_row.rowid, new_values));
         }
     }
