@@ -12,6 +12,7 @@ interface WasmDatabaseInstance {
   queryOne(sql: string): unknown | null;
   execMany(sql: string): void;
   toBuffer(): Uint8Array;
+  flush(): void;
   close(): void;
   free(): void;
 }
@@ -21,6 +22,7 @@ interface WasmDatabaseConstructor {
   openInMemory(): WasmDatabaseInstance;
   openWithOpfs(name: string): Promise<WasmDatabaseInstance>;
   openWithIdb(name: string): Promise<WasmDatabaseInstance>;
+  openPersisted(name: string): Promise<WasmDatabaseInstance>;
   fromBuffer(data: Uint8Array): WasmDatabaseInstance;
 }
 
@@ -71,7 +73,13 @@ export class Database {
       return new Database(inner);
     }
 
-    const inner = new mod.WasmDatabase();
+    if (backend === "memory") {
+      const inner = new mod.WasmDatabase();
+      return new Database(inner);
+    }
+
+    // Default: auto-detect best persistent backend
+    const inner = await mod.WasmDatabase.openPersisted(name ?? "rsqlite");
     return new Database(inner);
   }
 
@@ -112,6 +120,11 @@ export class Database {
   toBuffer(): Uint8Array {
     this.ensureOpen();
     return this.inner.toBuffer();
+  }
+
+  flush(): void {
+    this.ensureOpen();
+    this.inner.flush();
   }
 
   transaction<T>(fn: () => T): T {

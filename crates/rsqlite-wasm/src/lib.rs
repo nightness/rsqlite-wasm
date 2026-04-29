@@ -95,6 +95,15 @@ impl WasmDatabase {
         })
     }
 
+    #[wasm_bindgen(js_name = "openPersisted")]
+    pub async fn open_persisted(name: &str) -> Result<WasmDatabase, JsError> {
+        match Self::open_with_opfs(name).await {
+            Ok(db) => return Ok(db),
+            Err(_) => {}
+        }
+        Self::open_with_idb(name).await
+    }
+
     #[wasm_bindgen(js_name = "fromBuffer")]
     pub fn from_buffer(data: &[u8]) -> Result<WasmDatabase, JsError> {
         use rsqlite_vfs::OpenFlags;
@@ -194,6 +203,12 @@ impl WasmDatabase {
         let mut buf = vec![0u8; size];
         file.read(0, &mut buf).map_err(to_js_error)?;
         Ok(buf)
+    }
+
+    pub fn flush(&self) {
+        if let VfsBackend::Idb(vfs) = &self.backend {
+            vfs.flush_all_sync();
+        }
     }
 
     pub fn close(self) {}

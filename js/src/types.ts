@@ -7,5 +7,6 @@ export interface Row {
 }
 
 export interface DatabaseOptions {
+  /** Storage backend. Defaults to auto-detection (OPFS > IndexedDB). */
   backend?: "memory" | "opfs" | "indexeddb";
 }
