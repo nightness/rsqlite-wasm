@@ -753,4 +753,152 @@ mod tests {
 
         let _ = std::fs::remove_file(db_path);
     }
+
+    #[test]
+    fn order_by_asc() {
+        let db_path = "/tmp/rsqlite_db_order_asc.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'Charlie', 70)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'Alice', 90)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'Bob', 80)").unwrap();
+
+        let result = db.query("SELECT name, score FROM t ORDER BY name").unwrap();
+        use rsqlite_storage::codec::Value;
+        assert_eq!(result.rows[0].values[0], Value::Text("Alice".to_string()));
+        assert_eq!(result.rows[1].values[0], Value::Text("Bob".to_string()));
+        assert_eq!(result.rows[2].values[0], Value::Text("Charlie".to_string()));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn order_by_desc() {
+        let db_path = "/tmp/rsqlite_db_order_desc.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, score INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 70)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 90)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 80)").unwrap();
+
+        let result = db.query("SELECT * FROM t ORDER BY score DESC").unwrap();
+        use rsqlite_storage::codec::Value;
+        assert_eq!(result.rows[0].values[1], Value::Integer(90));
+        assert_eq!(result.rows[1].values[1], Value::Integer(80));
+        assert_eq!(result.rows[2].values[1], Value::Integer(70));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn limit_and_offset() {
+        let db_path = "/tmp/rsqlite_db_limit.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+            .unwrap();
+        for i in 1..=10 {
+            db.execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .unwrap();
+        }
+
+        // LIMIT only
+        let result = db.query("SELECT * FROM t LIMIT 3").unwrap();
+        assert_eq!(result.rows.len(), 3);
+
+        // LIMIT with OFFSET
+        let result = db.query("SELECT * FROM t LIMIT 3 OFFSET 5").unwrap();
+        assert_eq!(result.rows.len(), 3);
+        use rsqlite_storage::codec::Value;
+        assert_eq!(result.rows[0].values[1], Value::Integer(6));
+        assert_eq!(result.rows[2].values[1], Value::Integer(8));
+
+        // ORDER BY + LIMIT
+        let result = db.query("SELECT * FROM t ORDER BY val DESC LIMIT 2").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[1], Value::Integer(10));
+        assert_eq!(result.rows[1].values[1], Value::Integer(9));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn select_distinct() {
+        let db_path = "/tmp/rsqlite_db_distinct.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, color TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'red')").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'blue')").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'red')").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'green')").unwrap();
+        db.execute("INSERT INTO t VALUES (5, 'blue')").unwrap();
+
+        let result = db.query("SELECT DISTINCT color FROM t").unwrap();
+        assert_eq!(result.rows.len(), 3);
+
+        let colors: Vec<String> = result
+            .rows
+            .iter()
+            .map(|r| match &r.values[0] {
+                rsqlite_storage::codec::Value::Text(s) => s.clone(),
+                _ => panic!("expected text"),
+            })
+            .collect();
+        assert!(colors.contains(&"red".to_string()));
+        assert!(colors.contains(&"blue".to_string()));
+        assert!(colors.contains(&"green".to_string()));
+
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn order_by_multiple_keys() {
+        let db_path = "/tmp/rsqlite_db_order_multi.db";
+        let _ = std::fs::remove_file(db_path);
+
+        let vfs = rsqlite_vfs::native::NativeVfs::new();
+        let mut db = Database::create(&vfs, db_path).unwrap();
+
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, dept TEXT, score INTEGER)")
+            .unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'eng', 90)").unwrap();
+        db.execute("INSERT INTO t VALUES (2, 'sales', 80)").unwrap();
+        db.execute("INSERT INTO t VALUES (3, 'eng', 70)").unwrap();
+        db.execute("INSERT INTO t VALUES (4, 'sales', 95)").unwrap();
+
+        let result = db
+            .query("SELECT * FROM t ORDER BY dept ASC, score DESC")
+            .unwrap();
+        use rsqlite_storage::codec::Value;
+        // eng first (alphabetical), within eng: 90 then 70
+        assert_eq!(result.rows[0].values[1], Value::Text("eng".to_string()));
+        assert_eq!(result.rows[0].values[2], Value::Integer(90));
+        assert_eq!(result.rows[1].values[1], Value::Text("eng".to_string()));
+        assert_eq!(result.rows[1].values[2], Value::Integer(70));
+        // sales second, within sales: 95 then 80
+        assert_eq!(result.rows[2].values[1], Value::Text("sales".to_string()));
+        assert_eq!(result.rows[2].values[2], Value::Integer(95));
+        assert_eq!(result.rows[3].values[1], Value::Text("sales".to_string()));
+        assert_eq!(result.rows[3].values[2], Value::Integer(80));
+
+        let _ = std::fs::remove_file(db_path);
+    }
 }

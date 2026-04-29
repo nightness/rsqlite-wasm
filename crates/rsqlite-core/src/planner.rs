@@ -46,6 +46,13 @@ pub struct DeletePlan {
 }
 
 #[derive(Debug, Clone)]
+pub struct SortKey {
+    pub expr: PlanExpr,
+    pub descending: bool,
+    pub nulls_first: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
 pub enum Plan {
     Scan {
         table: String,
@@ -59,6 +66,18 @@ pub enum Plan {
     Project {
         input: Box<Plan>,
         outputs: Vec<ProjectionItem>,
+    },
+    Sort {
+        input: Box<Plan>,
+        keys: Vec<SortKey>,
+    },
+    Limit {
+        input: Box<Plan>,
+        limit: Option<u64>,
+        offset: u64,
+    },
+    Distinct {
+        input: Box<Plan>,
     },
     CreateTable(CreateTablePlan),
     Insert(InsertPlan),
@@ -215,10 +234,57 @@ fn plan_select(query: &ast::Query, catalog: &Catalog) -> Result<Plan> {
 
     // SELECT list -> Project
     let outputs = plan_select_items(&select.projection, &all_columns)?;
+    let output_names: Vec<String> = outputs.iter().map(|o| o.alias.clone()).collect();
     plan = Plan::Project {
         input: Box::new(plan),
         outputs,
     };
+
+    // DISTINCT
+    if select.distinct.is_some() {
+        plan = Plan::Distinct {
+            input: Box::new(plan),
+        };
+    }
+
+    // ORDER BY
+    if let Some(order_by) = &query.order_by {
+        if let ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+            let mut keys = Vec::new();
+            for ob in exprs {
+                let expr = plan_order_expr(&ob.expr, &all_columns, &output_names)?;
+                let descending = ob.options.asc == Some(false);
+                keys.push(SortKey {
+                    expr,
+                    descending,
+                    nulls_first: ob.options.nulls_first,
+                });
+            }
+            if !keys.is_empty() {
+                plan = Plan::Sort {
+                    input: Box::new(plan),
+                    keys,
+                };
+            }
+        }
+    }
+
+    // LIMIT / OFFSET
+    let limit_val = query.limit.as_ref().map(plan_limit_expr).transpose()?;
+    let offset_val = query
+        .offset
+        .as_ref()
+        .map(|o| plan_limit_expr(&o.value))
+        .transpose()?
+        .unwrap_or(0);
+
+    if limit_val.is_some() || offset_val > 0 {
+        plan = Plan::Limit {
+            input: Box::new(plan),
+            limit: limit_val,
+            offset: offset_val,
+        };
+    }
 
     Ok(plan)
 }
@@ -357,6 +423,50 @@ fn plan_binop(op: &ast::BinaryOperator) -> Result<BinOp> {
         ast::BinaryOperator::Divide => Ok(BinOp::Div),
         ast::BinaryOperator::Modulo => Ok(BinOp::Mod),
         _ => Err(Error::Other(format!("unsupported operator: {op}"))),
+    }
+}
+
+fn plan_order_expr(
+    expr: &Expr,
+    table_columns: &[ColumnRef],
+    output_names: &[String],
+) -> Result<PlanExpr> {
+    if let Expr::Identifier(ident) = expr {
+        let name = &ident.value;
+        if let Some(col) = table_columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+        {
+            return Ok(PlanExpr::Column(col.clone()));
+        }
+        if output_names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(name))
+        {
+            let col_ref = ColumnRef {
+                name: name.clone(),
+                column_index: 0,
+                is_rowid_alias: false,
+            };
+            return Ok(PlanExpr::Column(col_ref));
+        }
+    }
+    plan_expr(expr, table_columns)
+}
+
+fn plan_limit_expr(expr: &Expr) -> Result<u64> {
+    match expr {
+        Expr::Value(val) => match &val.value {
+            ast::Value::Number(n, _) => n.parse::<u64>().map_err(|_| {
+                Error::Other(format!("invalid LIMIT/OFFSET value: {n}"))
+            }),
+            _ => Err(Error::Other(format!(
+                "LIMIT/OFFSET must be a number, got: {val}"
+            ))),
+        },
+        _ => Err(Error::Other(format!(
+            "LIMIT/OFFSET must be a literal, got: {expr}"
+        ))),
     }
 }
 
