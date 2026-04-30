@@ -67,6 +67,7 @@ pub enum PlanExpr {
         expr: Box<PlanExpr>,
         pattern: Box<PlanExpr>,
         negated: bool,
+        escape_char: Option<char>,
     },
     InList {
         expr: Box<PlanExpr>,
@@ -130,12 +131,19 @@ pub enum BinOp {
     Div,
     Mod,
     Concat,
+    BitAnd,
+    BitOr,
+    ShiftLeft,
+    ShiftRight,
+    Is,
+    IsNot,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum UnaryOp {
     Not,
     Neg,
+    BitNot,
 }
 
 pub(super) fn plan_select_items(
@@ -248,6 +256,7 @@ pub fn plan_expr(expr: &Expr, columns: &[ColumnRef], catalog: &Catalog) -> Resul
             let op = match op {
                 ast::UnaryOperator::Not => UnaryOp::Not,
                 ast::UnaryOperator::Minus => UnaryOp::Neg,
+                ast::UnaryOperator::PGBitwiseNot => UnaryOp::BitNot,
                 _ => {
                     return Err(Error::Other(format!(
                         "unsupported unary operator: {op}"
@@ -266,6 +275,24 @@ pub fn plan_expr(expr: &Expr, columns: &[ColumnRef], catalog: &Catalog) -> Resul
         Expr::IsNotNull(e) => {
             let inner = plan_expr(e, columns, catalog)?;
             Ok(PlanExpr::IsNotNull(Box::new(inner)))
+        }
+        Expr::IsDistinctFrom(a, b) => {
+            let l = plan_expr(a, columns, catalog)?;
+            let r = plan_expr(b, columns, catalog)?;
+            Ok(PlanExpr::BinaryOp {
+                left: Box::new(l),
+                op: BinOp::IsNot,
+                right: Box::new(r),
+            })
+        }
+        Expr::IsNotDistinctFrom(a, b) => {
+            let l = plan_expr(a, columns, catalog)?;
+            let r = plan_expr(b, columns, catalog)?;
+            Ok(PlanExpr::BinaryOp {
+                left: Box::new(l),
+                op: BinOp::Is,
+                right: Box::new(r),
+            })
         }
         Expr::Nested(e) => plan_expr(e, columns, catalog),
         Expr::Collate { expr, collation } => {
@@ -301,28 +328,38 @@ pub fn plan_expr(expr: &Expr, columns: &[ColumnRef], catalog: &Catalog) -> Resul
             negated,
             expr: like_expr,
             pattern,
+            escape_char,
             ..
         } => {
             let e = plan_expr(like_expr, columns, catalog)?;
             let p = plan_expr(pattern, columns, catalog)?;
+            let esc = escape_char
+                .as_ref()
+                .and_then(|s| s.chars().next());
             Ok(PlanExpr::Like {
                 expr: Box::new(e),
                 pattern: Box::new(p),
                 negated: *negated,
+                escape_char: esc,
             })
         }
         Expr::ILike {
             negated,
             expr: like_expr,
             pattern,
+            escape_char,
             ..
         } => {
             let e = plan_expr(like_expr, columns, catalog)?;
             let p = plan_expr(pattern, columns, catalog)?;
+            let esc = escape_char
+                .as_ref()
+                .and_then(|s| s.chars().next());
             Ok(PlanExpr::Like {
                 expr: Box::new(e),
                 pattern: Box::new(p),
                 negated: *negated,
+                escape_char: esc,
             })
         }
         Expr::Between {
@@ -648,6 +685,10 @@ fn plan_binop(op: &ast::BinaryOperator) -> Result<BinOp> {
         ast::BinaryOperator::Divide => Ok(BinOp::Div),
         ast::BinaryOperator::Modulo => Ok(BinOp::Mod),
         ast::BinaryOperator::StringConcat => Ok(BinOp::Concat),
+        ast::BinaryOperator::BitwiseAnd => Ok(BinOp::BitAnd),
+        ast::BinaryOperator::BitwiseOr => Ok(BinOp::BitOr),
+        ast::BinaryOperator::PGBitwiseShiftLeft => Ok(BinOp::ShiftLeft),
+        ast::BinaryOperator::PGBitwiseShiftRight => Ok(BinOp::ShiftRight),
         _ => Err(Error::Other(format!("unsupported operator: {op}"))),
     }
 }

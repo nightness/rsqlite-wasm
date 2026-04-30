@@ -4,7 +4,7 @@ use rsqlite_storage::pager::Pager;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::eval_helpers::{
-    eval_binop, eval_cast, eval_scalar_function, eval_unaryop, is_truthy, like_match,
+    eval_binop, eval_cast, eval_scalar_function, eval_unaryop, is_truthy, like_match_with_escape,
     literal_to_value, value_to_text,
 };
 use crate::planner::{agg_column_name, PlanExpr};
@@ -105,6 +105,7 @@ pub(super) fn eval_expr(expr: &PlanExpr, row: &Row, columns: &[String], pager: &
             expr,
             pattern,
             negated,
+            escape_char,
         } => {
             let val = eval_expr(expr, row, columns, pager, catalog)?;
             let pat = eval_expr(pattern, row, columns, pager, catalog)?;
@@ -113,7 +114,7 @@ pub(super) fn eval_expr(expr: &PlanExpr, row: &Row, columns: &[String], pager: &
             }
             let val_str = value_to_text(&val);
             let pat_str = value_to_text(&pat);
-            let matched = like_match(&pat_str, &val_str);
+            let matched = like_match_with_escape(&pat_str, &val_str, *escape_char);
             let result = if *negated { !matched } else { matched };
             Ok(Value::Integer(if result { 1 } else { 0 }))
         }

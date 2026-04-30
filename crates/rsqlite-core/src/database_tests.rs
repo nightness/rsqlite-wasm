@@ -4995,6 +4995,145 @@
     }
 
     #[test]
+    fn bitwise_and_basic() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE flags (id INTEGER PRIMARY KEY, mask INTEGER)").unwrap();
+        db.execute("INSERT INTO flags VALUES (1, 12)").unwrap(); // 1100
+        let result = db.query("SELECT mask & 10 FROM flags").unwrap(); // 1010 -> 1000 = 8
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(8));
+    }
+
+    #[test]
+    fn bitwise_or_basic() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE flags (id INTEGER PRIMARY KEY, mask INTEGER)").unwrap();
+        db.execute("INSERT INTO flags VALUES (1, 12)").unwrap();
+        let result = db.query("SELECT mask | 3 FROM flags").unwrap(); // 1100 | 0011 = 1111 = 15
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(15));
+    }
+
+    #[test]
+    fn bitwise_in_where_clause() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE perms (id INTEGER PRIMARY KEY, mask INTEGER)").unwrap();
+        db.execute("INSERT INTO perms VALUES (1, 5), (2, 6), (3, 7)").unwrap();
+        // Rows where the read bit (1) is set: 5 (101), 7 (111) — that's 2 rows
+        let result = db.query("SELECT id FROM perms WHERE (mask & 1) = 1 ORDER BY id").unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(1));
+        assert_eq!(result.rows[1].values[0], crate::types::Value::Integer(3));
+    }
+
+    #[test]
+    fn bitwise_with_null_propagates() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, NULL)").unwrap();
+        let result = db.query("SELECT x & 5 FROM t").unwrap();
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Null);
+    }
+
+    #[test]
+    fn is_distinct_from_with_null() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1), (1, 2), (NULL, 1), (NULL, NULL)").unwrap();
+        // a IS DISTINCT FROM b: rows where a != b in null-safe sense
+        // (1,1) -> NOT distinct -> 0; (1,2) -> distinct -> 1; (NULL,1) -> distinct -> 1; (NULL,NULL) -> NOT distinct -> 0
+        let result = db
+            .query("SELECT a IS DISTINCT FROM b FROM t")
+            .unwrap();
+        assert_eq!(result.rows.len(), 4);
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(0));
+        assert_eq!(result.rows[1].values[0], crate::types::Value::Integer(1));
+        assert_eq!(result.rows[2].values[0], crate::types::Value::Integer(1));
+        assert_eq!(result.rows[3].values[0], crate::types::Value::Integer(0));
+    }
+
+    #[test]
+    fn is_not_distinct_from_with_null() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (a INTEGER, b INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 1), (NULL, NULL), (NULL, 5)").unwrap();
+        // (1,1) -> equal -> 1; (NULL,NULL) -> equal -> 1; (NULL,5) -> distinct -> 0
+        let result = db
+            .query("SELECT a IS NOT DISTINCT FROM b FROM t")
+            .unwrap();
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(1));
+        assert_eq!(result.rows[1].values[0], crate::types::Value::Integer(1));
+        assert_eq!(result.rows[2].values[0], crate::types::Value::Integer(0));
+    }
+
+    #[test]
+    fn is_distinct_from_in_where() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, status TEXT)").unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'active'), (2, 'pending'), (3, NULL), (4, 'active')",
+        )
+        .unwrap();
+        // = 'active' would miss NULL. IS NOT DISTINCT FROM 'active' is the same here,
+        // but IS DISTINCT FROM 'active' includes the NULL row.
+        let result = db
+            .query("SELECT id FROM t WHERE status IS DISTINCT FROM 'active' ORDER BY id")
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(2));
+        assert_eq!(result.rows[1].values[0], crate::types::Value::Integer(3));
+    }
+
+    #[test]
+    fn like_with_escape_percent() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, '50%'), (2, '50x'), (3, '50% off'), (4, 'abc')")
+            .unwrap();
+        // Match strings with literal % followed by anything
+        let result = db
+            .query(r"SELECT id FROM t WHERE label LIKE '50\%%' ESCAPE '\' ORDER BY id")
+            .unwrap();
+        assert_eq!(result.rows.len(), 2);
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(1));
+        assert_eq!(result.rows[1].values[0], crate::types::Value::Integer(3));
+    }
+
+    #[test]
+    fn like_with_escape_underscore() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a_b'), (2, 'aXb'), (3, 'a__b')").unwrap();
+        // Match literal underscore between a and b
+        let result = db
+            .query(r"SELECT id FROM t WHERE label LIKE 'a\_b' ESCAPE '\' ORDER BY id")
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(1));
+    }
+
+    #[test]
+    fn like_escape_with_custom_char() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, '50%'), (2, '50abc')").unwrap();
+        // Use # as escape char
+        let result = db
+            .query("SELECT id FROM t WHERE label LIKE '50#%' ESCAPE '#'")
+            .unwrap();
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].values[0], crate::types::Value::Integer(1));
+    }
+
+    #[test]
     fn default_persists_across_reopen() {
         let db_path = "/tmp/rsqlite_db_default_persist.db";
         let _ = std::fs::remove_file(db_path);

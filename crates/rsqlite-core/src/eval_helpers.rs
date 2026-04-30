@@ -489,19 +489,45 @@ pub(crate) fn value_to_text(val: &Value) -> String {
     }
 }
 
-pub(crate) fn like_match(pattern: &str, value: &str) -> bool {
+pub(crate) fn like_match_with_escape(
+    pattern: &str,
+    value: &str,
+    escape: Option<char>,
+) -> bool {
     let pat: Vec<char> = pattern.chars().collect();
     let val: Vec<char> = value.chars().collect();
-    like_match_inner(&pat, &val)
+    like_match_inner(&pat, &val, escape)
 }
 
-pub(crate) fn like_match_inner(pattern: &[char], value: &[char]) -> bool {
+pub(crate) fn like_match_inner(
+    pattern: &[char],
+    value: &[char],
+    escape: Option<char>,
+) -> bool {
     let mut pi = 0;
     let mut vi = 0;
     let mut star_pi = usize::MAX;
     let mut star_vi = 0;
 
     while vi < value.len() {
+        // Escape handling: an escape char in the pattern forces the next
+        // pattern char to be matched literally (no %/_ interpretation).
+        if let Some(esc) = escape {
+            if pi < pattern.len() && pattern[pi] == esc && pi + 1 < pattern.len() {
+                if pattern[pi + 1].to_ascii_lowercase() == value[vi].to_ascii_lowercase() {
+                    pi += 2;
+                    vi += 1;
+                    continue;
+                } else if star_pi != usize::MAX {
+                    pi = star_pi + 1;
+                    star_vi += 1;
+                    vi = star_vi;
+                    continue;
+                } else {
+                    return false;
+                }
+            }
+        }
         if pi < pattern.len() && pattern[pi] == '%' {
             star_pi = pi;
             star_vi = vi;
@@ -521,6 +547,8 @@ pub(crate) fn like_match_inner(pattern: &[char], value: &[char]) -> bool {
         }
     }
 
+    // Trailing % in pattern still matches; but trailing escape+char means we
+    // need a value char that doesn't exist — fall through.
     while pi < pattern.len() && pattern[pi] == '%' {
         pi += 1;
     }
@@ -709,6 +737,17 @@ pub(crate) fn eval_binop(op: BinOp, left: &Value, right: &Value) -> Result<Value
                     Ok(Value::Null)
                 }
             }
+            BinOp::Is => {
+                // NULL IS NULL = 1; NULL IS x or x IS NULL = 0
+                let both_null =
+                    matches!(left, Value::Null) && matches!(right, Value::Null);
+                Ok(Value::Integer(if both_null { 1 } else { 0 }))
+            }
+            BinOp::IsNot => {
+                let both_null =
+                    matches!(left, Value::Null) && matches!(right, Value::Null);
+                Ok(Value::Integer(if both_null { 0 } else { 1 }))
+            }
             _ => Ok(Value::Null),
         };
     }
@@ -752,6 +791,49 @@ pub(crate) fn eval_binop(op: BinOp, left: &Value, right: &Value) -> Result<Value
             let r = value_to_text(right);
             Ok(Value::Text(format!("{l}{r}")))
         }
+        BinOp::BitAnd => Ok(Value::Integer(value_to_int(left) & value_to_int(right))),
+        BinOp::BitOr => Ok(Value::Integer(value_to_int(left) | value_to_int(right))),
+        BinOp::ShiftLeft => {
+            let shift = value_to_int(right);
+            let val = value_to_int(left);
+            if shift < 0 {
+                // SQLite: negative shift becomes opposite-direction shift
+                Ok(Value::Integer(val.wrapping_shr((-shift) as u32 & 63)))
+            } else {
+                Ok(Value::Integer(val.wrapping_shl(shift as u32 & 63)))
+            }
+        }
+        BinOp::ShiftRight => {
+            let shift = value_to_int(right);
+            let val = value_to_int(left);
+            if shift < 0 {
+                Ok(Value::Integer(val.wrapping_shl((-shift) as u32 & 63)))
+            } else {
+                Ok(Value::Integer(val.wrapping_shr(shift as u32 & 63)))
+            }
+        }
+        BinOp::Is | BinOp::IsNot => {
+            // NULL was already returned above, so neither side is NULL here.
+            // Fall through to plain equality.
+            let eq = compare(left, right) == 0;
+            let result = match op { BinOp::Is => eq, _ => !eq };
+            Ok(Value::Integer(if result { 1 } else { 0 }))
+        }
+    }
+}
+
+/// Coerce any SQLite value to i64 for bitwise operations.
+/// NULL was filtered out by the caller; this only handles non-null values.
+pub(crate) fn value_to_int(val: &Value) -> i64 {
+    match val {
+        Value::Null => 0,
+        Value::Integer(n) => *n,
+        Value::Real(f) => *f as i64,
+        Value::Text(s) => s.trim().parse::<i64>().unwrap_or(0),
+        Value::Blob(b) => {
+            let s = String::from_utf8_lossy(b);
+            s.trim().parse::<i64>().unwrap_or(0)
+        }
     }
 }
 
@@ -763,6 +845,8 @@ pub(crate) fn eval_unaryop(op: UnaryOp, val: &Value) -> Result<Value> {
         (UnaryOp::Neg, Value::Integer(n)) => Ok(Value::Integer(-n)),
         (UnaryOp::Neg, Value::Real(f)) => Ok(Value::Real(-f)),
         (UnaryOp::Neg, _) => Ok(Value::Integer(0)),
+        (UnaryOp::BitNot, Value::Null) => Ok(Value::Null),
+        (UnaryOp::BitNot, v) => Ok(Value::Integer(!value_to_int(v))),
     }
 }
 
