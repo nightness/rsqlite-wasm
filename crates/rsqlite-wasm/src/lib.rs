@@ -187,14 +187,8 @@ impl WasmDatabase {
 
     #[wasm_bindgen(js_name = "execMany")]
     pub fn exec_many(&mut self, sql: &str) -> Result<(), JsError> {
-        let statements: Vec<&str> = sql.split(';').collect();
-        for stmt in statements {
-            let trimmed = stmt.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            let full = format!("{trimmed};");
-            self.db.execute_sql(&full).map_err(to_js_error)?;
+        for stmt in split_statements(sql) {
+            self.db.execute_sql(&stmt).map_err(to_js_error)?;
         }
         Ok(())
     }
@@ -287,6 +281,52 @@ fn js_to_value(val: &JsValue) -> Value {
     } else {
         Value::Null
     }
+}
+
+/// Split a multi-statement SQL string on semicolons, but keep
+/// `BEGIN...END` blocks (used in trigger bodies) intact.
+fn split_statements(sql: &str) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0u32;
+
+    for raw_part in sql.split(';') {
+        let trimmed = raw_part.trim();
+        if trimmed.is_empty() && depth == 0 {
+            continue;
+        }
+
+        if !current.is_empty() {
+            current.push(';');
+        }
+        current.push_str(raw_part);
+
+        let upper = trimmed.to_uppercase();
+        for word in upper.split_whitespace() {
+            if word == "BEGIN" {
+                depth += 1;
+            } else if word == "END" && depth > 0 {
+                depth -= 1;
+            }
+        }
+
+        if depth == 0 {
+            let stmt = current.trim().to_string();
+            if !stmt.is_empty() {
+                let terminated = if stmt.ends_with(';') { stmt } else { format!("{stmt};") };
+                result.push(terminated);
+            }
+            current.clear();
+        }
+    }
+
+    if !current.trim().is_empty() {
+        let stmt = current.trim().to_string();
+        let terminated = if stmt.ends_with(';') { stmt } else { format!("{stmt};") };
+        result.push(terminated);
+    }
+
+    result
 }
 
 fn to_js_error(e: impl std::fmt::Display) -> JsError {
