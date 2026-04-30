@@ -35,7 +35,7 @@ export class WorkerDatabase {
   }
 
   static async open(name?: string, options?: DatabaseOptions): Promise<WorkerDatabase> {
-    const workerUrl = new URL("./worker.js", import.meta.url);
+    const workerUrl = options?.workerUrl ?? new URL("./worker.js", import.meta.url);
     const worker = new Worker(workerUrl, { type: "module" });
     const db = new WorkerDatabase(worker);
     await db.send({
