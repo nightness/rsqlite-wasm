@@ -370,6 +370,62 @@ fn expression_index_maintained_on_update_and_delete() {
     assert_eq!(count.rows[0].values[0], Value::Integer(1));
 }
 
+// ── Expression index lookup-time use ──────────────────────────────────
+
+#[test]
+fn expression_index_picked_for_matching_query() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE INDEX idx_lower_name ON t(lower(name))").unwrap();
+    db.execute(
+        "INSERT INTO t VALUES (1, 'Alice'), (2, 'BOB'), (3, 'carol'), (4, 'DAVE')",
+    )
+    .unwrap();
+
+    let plan = db
+        .query("EXPLAIN QUERY PLAN SELECT id FROM t WHERE lower(name) = 'bob'")
+        .unwrap();
+    let plan_text = plan
+        .rows
+        .iter()
+        .map(|r| {
+            r.values
+                .iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("idx_lower_name") || plan_text.contains("INDEX"),
+        "EXPLAIN QUERY PLAN didn't show the expression index being used: {plan_text}"
+    );
+    let r = db
+        .query("SELECT id FROM t WHERE lower(name) = 'bob'")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(2));
+}
+
+#[test]
+fn expression_index_returns_correct_rows_for_multiple_matches() {
+    // The index is over `lower(name)`. Two rows share the same indexed
+    // value. The Filter wrap must still let both come through.
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE INDEX idx_lower_name ON t(lower(name))").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'EVE'), (2, 'eve'), (3, 'frank')")
+        .unwrap();
+
+    let r = db
+        .query("SELECT id FROM t WHERE lower(name) = 'eve' ORDER BY id")
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0].values[0], Value::Integer(1));
+    assert_eq!(r.rows[1].values[0], Value::Integer(2));
+}
+
 // ── Partial index lookup-time use ─────────────────────────────────────
 
 #[test]

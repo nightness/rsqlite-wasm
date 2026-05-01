@@ -53,12 +53,13 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
   top-level conjunct (the conservative case). More elaborate
   predicate-implication shapes still fall back to full scan; correctness
   is preserved either way.
-- **Expression indexes** (`CREATE INDEX ... ON t(lower(name))`) now
-  build with the expression evaluated against each row, and INSERT /
-  UPDATE / DELETE keep the index in sync. The planner doesn't yet
-  recognize `expr(col) = literal` patterns at lookup time, so reads
-  still go through a full table scan — the index exists, it just
-  isn't picked yet. Correctness is preserved.
+- **Expression indexes** (`CREATE INDEX ... ON t(lower(name))`) build
+  with the expression evaluated against each row, and INSERT /
+  UPDATE / DELETE keep the index in sync. The planner picks the
+  index when a `<idx_expr> = <literal>` conjunct appears in the WHERE
+  (e.g. `WHERE lower(name) = 'bob'`). Single-column expression
+  indexes only for now; multi-column expression indexes still fall
+  back to a full table scan.
 
 ## DML
 
@@ -98,8 +99,7 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 
 These are tracked as v0.2 candidates:
 
-1. Expression-index *lookup-time* use (planner pattern matching of
-   `expr(col)` against indexed expressions; build side already works)
+1. Multi-column expression-index lookup (single-column already works).
 2. UPDATE LIMIT / ORDER BY (needs custom parser path)
 3. Bare `rowid` on tables without an alias (synthetic column or Row.rowid)
 4. sqlite_schema root-page split (btree restructure)

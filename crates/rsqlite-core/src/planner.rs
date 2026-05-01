@@ -1558,8 +1558,9 @@ fn collect_and_conjuncts(expr: &PlanExpr) -> Vec<&PlanExpr> {
 }
 
 /// Conservative structural equality on PlanExpr — covers the cases we need
-/// for partial-index matching (Column, Literal, BinaryOp, UnaryOp, IsNull,
-/// IsNotNull). Anything else returns false rather than risk a false match.
+/// for partial-index and expression-index matching (Column, Literal,
+/// BinaryOp, UnaryOp, IsNull, IsNotNull, Function, Cast). Anything else
+/// returns false rather than risk a false match.
 fn plan_exprs_structurally_equal(a: &PlanExpr, b: &PlanExpr) -> bool {
     match (a, b) {
         (PlanExpr::Column(ca), PlanExpr::Column(cb)) => {
@@ -1583,6 +1584,18 @@ fn plan_exprs_structurally_equal(a: &PlanExpr, b: &PlanExpr) -> bool {
         | (PlanExpr::IsNotNull(aa), PlanExpr::IsNotNull(bb)) => {
             plan_exprs_structurally_equal(aa, bb)
         }
+        (PlanExpr::Function { name: na, args: aa },
+         PlanExpr::Function { name: nb, args: ab }) => {
+            na.eq_ignore_ascii_case(nb)
+                && aa.len() == ab.len()
+                && aa.iter()
+                    .zip(ab.iter())
+                    .all(|(x, y)| plan_exprs_structurally_equal(x, y))
+        }
+        (PlanExpr::Cast { expr: ea, type_name: ta },
+         PlanExpr::Cast { expr: eb, type_name: tb }) => {
+            ta.eq_ignore_ascii_case(tb) && plan_exprs_structurally_equal(ea, eb)
+        }
         _ => false,
     }
 }
@@ -1602,7 +1615,8 @@ fn try_index_scan(
         _ => return None,
     };
 
-    let eq_parts = extract_equality_parts(predicate)?;
+    let eq_parts = extract_equality_parts(predicate);
+    let eq_parts_ref: &[_] = eq_parts.as_deref().unwrap_or(&[]);
 
     for idx_def in catalog.indexes.values() {
         if !idx_def.table_name.eq_ignore_ascii_case(table_name) {
@@ -1621,12 +1635,12 @@ fn try_index_scan(
             }
         }
 
-        if eq_parts.len() >= idx_def.columns.len() {
+        if eq_parts_ref.len() >= idx_def.columns.len() {
             let mut lookup_values = Vec::new();
             let mut all_matched = true;
 
             for idx_col in &idx_def.columns {
-                let found = eq_parts
+                let found = eq_parts_ref
                     .iter()
                     .find(|(col_name, _)| col_name.eq_ignore_ascii_case(idx_col));
                 match found {
@@ -1662,11 +1676,131 @@ fn try_index_scan(
         }
     }
 
+    // Try expression-index lookup. Single-column expression indexes only
+    // for now; matches `<idx_expr> = <literal>` (or its mirror) anywhere
+    // in the WHERE's top-level And tree. Remaining conjuncts are wrapped
+    // in a Filter — slight redundant work for the matched part, but
+    // correct.
+    if let Some(plan) =
+        try_expression_index_scan(table_name, table_root, columns, predicate, _all_columns, catalog)
+    {
+        return Some(plan);
+    }
+
     if let Some(range_plan) = try_range_scan(table_name, table_root, columns, predicate, catalog) {
         return Some(range_plan);
     }
 
     None
+}
+
+fn try_expression_index_scan(
+    table_name: &str,
+    table_root: u32,
+    columns: &[ColumnRef],
+    predicate: &PlanExpr,
+    all_columns: &[ColumnRef],
+    catalog: &Catalog,
+) -> Option<Plan> {
+    // Collect top-level `<anything> = <literal>` equalities from the WHERE.
+    let mut general_eqs: Vec<(PlanExpr, PlanExpr)> = Vec::new();
+    collect_general_equalities(predicate, &mut general_eqs);
+    if general_eqs.is_empty() {
+        return None;
+    }
+
+    for idx_def in catalog.indexes.values() {
+        if !idx_def.table_name.eq_ignore_ascii_case(table_name) {
+            continue;
+        }
+        if idx_def.columns.len() != 1 {
+            continue;
+        }
+        if idx_def.predicate.is_some() {
+            continue;
+        }
+        let col_src = &idx_def.columns[0];
+        // Plain-column indexes already covered by try_index_scan's main path.
+        if all_columns
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(col_src))
+        {
+            continue;
+        }
+
+        // Parse the index's expression source.
+        let parsed = match rsqlite_parser::parse::parse_sql(&format!("SELECT {col_src}")) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let expr_ast = parsed.into_iter().next().and_then(|stmt| {
+            if let sqlparser::ast::Statement::Query(q) = stmt {
+                if let sqlparser::ast::SetExpr::Select(sel) = *q.body {
+                    return sel.projection.into_iter().next().and_then(|item| {
+                        if let sqlparser::ast::SelectItem::UnnamedExpr(e) = item {
+                            Some(e)
+                        } else {
+                            None
+                        }
+                    });
+                }
+            }
+            None
+        });
+        let Some(expr_ast) = expr_ast else { continue };
+        let Ok(idx_expr) = plan_expr(&expr_ast, all_columns, catalog) else {
+            continue;
+        };
+
+        for (lhs, rhs) in &general_eqs {
+            if plan_exprs_structurally_equal(lhs, &idx_expr) {
+                let index_scan = Plan::IndexScan {
+                    table: table_name.to_string(),
+                    table_root_page: table_root,
+                    index_root_page: idx_def.root_page,
+                    columns: columns.to_vec(),
+                    index_columns: idx_def.columns.clone(),
+                    lookup_values: vec![rhs.clone()],
+                };
+                // Wrap with the full predicate as a Filter; the index narrows
+                // the candidate set but doesn't strip already-matched
+                // conjuncts (a v0.2 optimization).
+                return Some(Plan::Filter {
+                    input: Box::new(index_scan),
+                    predicate: predicate.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Collect every top-level `<expr> = <literal>` equality from the WHERE
+/// (And-tree). The literal can be on either side. Used by
+/// expression-index matching, where a column lookup isn't enough.
+fn collect_general_equalities(expr: &PlanExpr, out: &mut Vec<(PlanExpr, PlanExpr)>) {
+    match expr {
+        PlanExpr::BinaryOp {
+            left,
+            op: BinOp::And,
+            right,
+        } => {
+            collect_general_equalities(left, out);
+            collect_general_equalities(right, out);
+        }
+        PlanExpr::BinaryOp {
+            left,
+            op: BinOp::Eq,
+            right,
+        } => {
+            if matches!(right.as_ref(), PlanExpr::Literal(_)) {
+                out.push((*left.clone(), *right.clone()));
+            } else if matches!(left.as_ref(), PlanExpr::Literal(_)) {
+                out.push((*right.clone(), *left.clone()));
+            }
+        }
+        _ => {}
+    }
 }
 
 fn try_range_scan(
