@@ -12,9 +12,14 @@ Databases created by rsqlite-wasm are **file-format compatible** with SQLite —
 - **Web Worker architecture** — all I/O runs off the main thread
 - **Vector search** — built-in `vec_distance_cosine`, `vec_distance_l2`, and `vec_distance_dot` functions for embedding similarity search
 - **Small binary** — ~1.6 MB WASM with LTO + `opt-level=z`
-- **324+ tests** — comprehensive coverage across all crates
+- **420+ tests** — comprehensive coverage across all crates
 
 ## SQL Support
+
+The full deferred-feature inventory lives in [LIMITATIONS.md](./LIMITATIONS.md).
+The list below is the headline-feature surface; LIMITATIONS is the truth-source for what doesn't work.
+
+
 
 ### Fully supported
 
