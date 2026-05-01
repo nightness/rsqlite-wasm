@@ -358,9 +358,33 @@ fn preprocess_is_truth_family(sql: &str) -> String {
             continue;
         }
 
-        // Try to match an identifier optionally followed by IS [NOT] TRUE/FALSE.
+        // Try to match an identifier or parenthesized expression
+        // optionally followed by IS [NOT] TRUE/FALSE.
         let id_start = i;
-        let id = scan_identifier(bytes, &mut i);
+        let id = if ch == '(' {
+            // Parenthesized LHS: capture the balanced (...) verbatim so
+            // arbitrary expressions like `(a + b)` work.
+            let start = i;
+            let mut depth = 1;
+            i += 1;
+            while i < n && depth > 0 {
+                let c = bytes[i] as char;
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
+                    depth -= 1;
+                }
+                i += 1;
+            }
+            if depth != 0 {
+                out.push(ch);
+                i = start + 1;
+                continue;
+            }
+            String::from_utf8_lossy(&bytes[start..i]).into_owned()
+        } else {
+            scan_identifier(bytes, &mut i)
+        };
         if id.is_empty() {
             out.push(ch);
             i += 1;

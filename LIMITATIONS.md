@@ -26,14 +26,16 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
   work as native operators since SQLiteDialect accepts them.
 
 - **`x IS TRUE` / `x IS FALSE` / `x IS NOT TRUE` / `x IS NOT FALSE`.**
-  The syntax form is supported when `x` is a single identifier
-  (`col`, `t.col`, `"quoted col"`); the parser pre-pass rewrites it
-  into `(x IS NOT NULL AND x <> 0)` etc. before handing it to
-  SQLiteDialect. For arbitrary LHS expressions (`(a + b) IS TRUE`),
-  use the function form `is_true(...)` / `is_false(...)` /
-  `is_not_true(...)` / `is_not_false(...)` — semantics match SQLite's
-  truthiness rule (NULL is unknown; integer/real != 0 is true; text
-  is true if it parses as a non-zero number).
+  Supported as syntax when the LHS is a single identifier
+  (`col`, `t.col`, `"quoted col"`) or a parenthesized expression
+  (`(a + b) IS TRUE`); the parser pre-pass rewrites it into
+  `(x IS NOT NULL AND x <> 0)` etc. before handing it to
+  SQLiteDialect. The function-form fallbacks `is_true(...)` /
+  `is_false(...)` / `is_not_true(...)` / `is_not_false(...)`
+  remain available for shapes the rewriter can't match.
+  Truthiness follows SQLite semantics: NULL is unknown;
+  integer/real != 0 is true; text is true if it parses as a
+  non-zero number.
 
 ## Schema
 
@@ -113,8 +115,6 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 These are tracked as v0.2 candidates:
 
 1. sqlite_schema root-page split (btree restructure).
-3. `IS TRUE` / `IS FALSE` syntax with arbitrary expression LHS
-   (single-identifier form already works via parser pre-pass).
 4. Partial-index implication beyond the verbatim-conjunct case
    (e.g. tighter range proves looser range).
 5. FTS5 / R-Tree / HNSW vector index modules — the vtab foundation

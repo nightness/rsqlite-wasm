@@ -729,6 +729,32 @@ fn is_not_false_syntax_includes_null() {
 }
 
 #[test]
+fn is_true_syntax_with_parenthesized_lhs() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2, 3), (2, 0, 0), (3, NULL, 5)")
+        .unwrap();
+    // `(a + b) IS TRUE` matches rows where a+b is non-null and != 0.
+    let r = db
+        .query("SELECT id FROM t WHERE (a + b) IS TRUE ORDER BY id")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(1));
+}
+
+#[test]
+fn is_false_syntax_with_parenthesized_lhs() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 2, 3), (2, 0, 0)").unwrap();
+    let r = db
+        .query("SELECT id FROM t WHERE (a + b) IS FALSE")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(2));
+}
+
+#[test]
 fn is_true_syntax_does_not_corrupt_string_literals() {
     // The literal `'IS TRUE'` should NOT be rewritten — preprocessing
     // must respect string boundaries.
