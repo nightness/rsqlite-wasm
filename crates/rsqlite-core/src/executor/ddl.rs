@@ -348,11 +348,7 @@ pub(super) fn execute_alter_rename(
         btree_delete(pager, 1, *rowid).map_err(|e| Error::Other(e.to_string()))?;
         let new_root =
             btree_insert(pager, 1, *rowid, &new_record).map_err(|e| Error::Other(e.to_string()))?;
-        if new_root != 1 {
-            return Err(Error::Other(
-                "sqlite_schema root page split — not yet supported".to_string(),
-            ));
-        }
+        debug_assert_eq!(new_root, 1, "sqlite_schema root must remain page 1");
     }
 
     if !pager.in_transaction() {
@@ -452,11 +448,7 @@ pub(super) fn execute_alter_add_column(
     btree_delete(pager, 1, rowid).map_err(|e| Error::Other(e.to_string()))?;
     let new_root =
         btree_insert(pager, 1, rowid, &new_record).map_err(|e| Error::Other(e.to_string()))?;
-    if new_root != 1 {
-        return Err(Error::Other(
-            "sqlite_schema root page split — not yet supported".to_string(),
-        ));
-    }
+    debug_assert_eq!(new_root, 1, "sqlite_schema root must remain page 1");
 
     if !pager.in_transaction() {
         pager.flush()?;

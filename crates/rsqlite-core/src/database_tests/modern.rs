@@ -1996,6 +1996,40 @@ fn partial_index_maintained_on_insert() {
 }
 
 #[test]
+fn schema_root_page_splits_when_many_tables_created() {
+    // Create enough tables that the sqlite_schema btree must overflow
+    // page 1 (which has only ~3.9 KB of usable space after the 100-byte
+    // file header). A balance-deeper at page 1 keeps the schema's root
+    // pinned to page 1 while spilling cells to a fresh leaf chain.
+    let db_path = "/tmp/rsqlite_schema_root_split.db";
+    let _ = std::fs::remove_file(db_path);
+    let vfs = rsqlite_vfs::native::NativeVfs::new();
+    let n: usize = 1500;
+    {
+        let mut db = Database::create(&vfs, db_path).unwrap();
+        for i in 0..n {
+            // The CREATE TABLE statement's stored SQL takes ~30-40 bytes
+            // per row in sqlite_schema; 1500 rows * ~35 bytes = 52 KB,
+            // well past page 1's leaf capacity.
+            db.execute(&format!("CREATE TABLE t_{i} (id INTEGER)")).unwrap();
+        }
+    }
+    {
+        let mut db = Database::open(&vfs, db_path).unwrap();
+        // After reopen the catalog should reload every entry from the
+        // multi-page sqlite_schema btree. Spot-check tables at the
+        // beginning, middle, and end of the inserted range.
+        for i in [0usize, n / 2, n - 1] {
+            db.execute(&format!("INSERT INTO t_{i} VALUES ({i})")).unwrap();
+            let r = db.query(&format!("SELECT id FROM t_{i}")).unwrap();
+            assert_eq!(r.rows.len(), 1, "table t_{i} should be reachable after reopen");
+            assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(i as i64));
+        }
+    }
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
 fn partial_index_persists_predicate_across_reopen() {
     let db_path = "/tmp/rsqlite_partial_index_persist.db";
     let _ = std::fs::remove_file(db_path);

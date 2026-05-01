@@ -49,10 +49,6 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
   even when the table has no rowid alias. Computed result rows
   (aggregates, projections, joins) leave `rowid` unset, so referencing
   `rowid` on those still errors.
-- **`sqlite_schema` root-page split.** Schemas with very many CREATE
-  TABLE / INDEX statements (large enough that the schema metadata
-  itself outgrows page 1) error during DDL. Workaround: keep the
-  schema modest, or split across multiple attached databases.
 
 ## Indexes
 
@@ -141,13 +137,12 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 
 These are tracked as v0.2 candidates:
 
-1. sqlite_schema root-page split (btree restructure).
-2. Real HNSW graph + R*-Tree split heuristic + FTS5 inverted index +
+1. Real HNSW graph + R*-Tree split heuristic + FTS5 inverted index +
    BM25 (the brute-force `vec_index`, `rtree`, and `fts5` shipped
    today are API-shaped for the swap; multi-column FTS5 with
    per-column weights and the native `MATCH` operator also belong
    here).
-3. WITHOUT ROWID storage rewrite — the syntax is accepted and PK
+2. WITHOUT ROWID storage rewrite — the syntax is accepted and PK
    uniqueness enforced today, but real composite-PK-as-btree-key
    storage (for SQLite file-format compat on those tables) is
    deferred to v0.2.

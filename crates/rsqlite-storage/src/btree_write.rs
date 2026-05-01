@@ -58,14 +58,20 @@ fn insert_into_page(pager: &mut Pager, page_num: u32, rowid: i64, cell: &[u8]) -
                 new_page,
                 median_rowid,
             } => {
-                let new_root = pager.allocate_page()?;
-                {
-                    let root_data = &mut pager.get_page_mut(new_root)?.data;
-                    init_interior_page(root_data, new_root, new_page);
+                if page_num == 1 {
+                    // Page 1 must remain the schema root; deepen instead.
+                    balance_deeper_table_root(pager, 1, new_page, median_rowid)?;
+                    Ok(1)
+                } else {
+                    let new_root = pager.allocate_page()?;
+                    {
+                        let root_data = &mut pager.get_page_mut(new_root)?.data;
+                        init_interior_page(root_data, new_root, new_page);
+                    }
+                    let interior_cell = build_table_interior_cell(page_num, median_rowid);
+                    insert_cell_into_interior(pager, new_root, &interior_cell)?;
+                    Ok(new_root)
                 }
-                let interior_cell = build_table_interior_cell(page_num, median_rowid);
-                insert_cell_into_interior(pager, new_root, &interior_cell)?;
-                Ok(new_root)
             }
         }
     } else {
@@ -103,14 +109,19 @@ fn insert_into_page(pager: &mut Pager, page_num: u32, rowid: i64, cell: &[u8]) -
                             new_page: new_int_page,
                             median_rowid: med,
                         } => {
-                            let new_root = pager.allocate_page()?;
-                            {
-                                let root_data = &mut pager.get_page_mut(new_root)?.data;
-                                init_interior_page(root_data, new_root, new_int_page);
+                            if page_num == 1 {
+                                balance_deeper_table_root(pager, 1, new_int_page, med)?;
+                                Ok(1)
+                            } else {
+                                let new_root = pager.allocate_page()?;
+                                {
+                                    let root_data = &mut pager.get_page_mut(new_root)?.data;
+                                    init_interior_page(root_data, new_root, new_int_page);
+                                }
+                                let root_cell = build_table_interior_cell(page_num, med);
+                                insert_cell_into_interior(pager, new_root, &root_cell)?;
+                                Ok(new_root)
                             }
-                            let root_cell = build_table_interior_cell(page_num, med);
-                            insert_cell_into_interior(pager, new_root, &root_cell)?;
-                            Ok(new_root)
                         }
                     }
                 }
@@ -123,6 +134,80 @@ fn insert_into_page(pager: &mut Pager, page_num: u32, rowid: i64, cell: &[u8]) -
             Ok(page_num)
         }
     }
+}
+
+/// Keep `root_page` as the b-tree root while accommodating a split. The
+/// existing root content moves to a freshly allocated `new_left`, and the
+/// root is re-initialized as an interior page pointing to (`new_left`,
+/// `new_right_page`). Used for page 1 (sqlite_schema) which must remain
+/// the schema's root forever.
+fn balance_deeper_table_root(
+    pager: &mut Pager,
+    root_page: u32,
+    new_right_page: u32,
+    median_rowid: i64,
+) -> Result<()> {
+    let new_left = pager.allocate_page()?;
+    copy_table_page_content(pager, root_page, new_left)?;
+    {
+        let root_data = &mut pager.get_page_mut(root_page)?.data;
+        init_interior_page(root_data, root_page, new_right_page);
+    }
+    let interior_cell = build_table_interior_cell(new_left, median_rowid);
+    insert_cell_into_interior(pager, root_page, &interior_cell)?;
+    Ok(())
+}
+
+/// Copy the b-tree content of `src` to `dst`. Cells are reparsed and
+/// rewritten so the offset shift between page 1 (offset 100) and a regular
+/// page (offset 0) is handled transparently. Supports both leaf and
+/// interior table pages.
+fn copy_table_page_content(pager: &mut Pager, src: u32, dst: u32) -> Result<()> {
+    let usable = pager.usable_size();
+    let src_data = pager.get_page(src)?.data.clone();
+    let src_offset = btree_header_offset(src);
+    let header = parse_btree_header(&src_data, src_offset)?;
+    let pointers =
+        read_cell_pointers(&src_data, src_offset + header.header_size(), header.cell_count);
+
+    match header.page_type {
+        PageType::LeafTable => {
+            let mut cells = Vec::with_capacity(pointers.len());
+            for &ptr in &pointers {
+                let c = parse_table_leaf_cell(&src_data, ptr as usize, usable)?;
+                let raw = build_table_leaf_cell(c.rowid, &c.payload);
+                cells.push((c.rowid, raw));
+            }
+            {
+                let data = &mut pager.get_page_mut(dst)?.data;
+                init_leaf_page(data, dst);
+            }
+            rewrite_leaf_page(pager, dst, &cells)?;
+        }
+        PageType::InteriorTable => {
+            let right_child = header
+                .right_most_pointer
+                .ok_or_else(|| StorageError::Other("interior page missing right_most".into()))?;
+            let mut cells: Vec<Vec<u8>> = Vec::with_capacity(pointers.len());
+            for &ptr in &pointers {
+                let ic = parse_table_interior_cell(&src_data, ptr as usize);
+                cells.push(build_table_interior_cell(ic.left_child_page, ic.rowid));
+            }
+            {
+                let data = &mut pager.get_page_mut(dst)?.data;
+                init_interior_page(data, dst, right_child);
+            }
+            for cell in cells {
+                insert_cell_into_interior(pager, dst, &cell)?;
+            }
+        }
+        other => {
+            return Err(StorageError::Other(format!(
+                "copy_table_page_content: unsupported page type {other:?}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 enum InsertResult {
@@ -789,11 +874,10 @@ pub fn insert_schema_entry(
     let new_rowid = max_rowid + 1;
     let new_root = btree_insert(pager, 1, new_rowid, &record)?;
 
-    if new_root != 1 {
-        return Err(StorageError::Other(
-            "sqlite_schema root page split — not yet supported".to_string(),
-        ));
-    }
+    debug_assert_eq!(
+        new_root, 1,
+        "sqlite_schema root must remain page 1 after insert (deepening should keep it)"
+    );
 
     Ok(())
 }
