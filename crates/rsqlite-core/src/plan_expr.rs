@@ -101,6 +101,7 @@ pub enum PlanExpr {
         args: Vec<PlanExpr>,
         partition_by: Vec<PlanExpr>,
         order_by: Vec<(PlanExpr, bool)>,
+        frame: Option<WindowFrameSpec>,
     },
     Collate {
         expr: Box<PlanExpr>,
@@ -148,6 +149,29 @@ pub enum UnaryOp {
     Not,
     Neg,
     BitNot,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowFrameSpec {
+    pub units: FrameUnits,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FrameUnits {
+    Rows,
+    Range,
+    Groups,
+}
+
+#[derive(Debug, Clone)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
 }
 
 pub(super) fn plan_select_items(
@@ -949,12 +973,58 @@ fn plan_window_function(
         return Err(Error::Other(format!("unknown window function: {name}")));
     }
 
+    let frame = spec.window_frame.as_ref().map(|wf| {
+        let units = match wf.units {
+            ast::WindowFrameUnits::Rows => FrameUnits::Rows,
+            ast::WindowFrameUnits::Range => FrameUnits::Range,
+            ast::WindowFrameUnits::Groups => FrameUnits::Groups,
+        };
+        let start = plan_frame_bound(&wf.start_bound);
+        let end = wf
+            .end_bound
+            .as_ref()
+            .map(plan_frame_bound)
+            .unwrap_or(FrameBound::CurrentRow);
+        WindowFrameSpec { units, start, end }
+    });
+
     Ok(PlanExpr::WindowFunction {
         func_name: name.to_string(),
         args,
         partition_by,
         order_by,
+        frame,
     })
+}
+
+fn plan_frame_bound(bound: &ast::WindowFrameBound) -> FrameBound {
+    match bound {
+        ast::WindowFrameBound::CurrentRow => FrameBound::CurrentRow,
+        ast::WindowFrameBound::Preceding(None) => FrameBound::UnboundedPreceding,
+        ast::WindowFrameBound::Following(None) => FrameBound::UnboundedFollowing,
+        ast::WindowFrameBound::Preceding(Some(expr)) => {
+            FrameBound::Preceding(eval_static_int(expr).unwrap_or(0))
+        }
+        ast::WindowFrameBound::Following(Some(expr)) => {
+            FrameBound::Following(eval_static_int(expr).unwrap_or(0))
+        }
+    }
+}
+
+/// Best-effort static evaluation of a frame-bound expression. SQL only allows
+/// constants here, so an integer literal (with optional unary minus) covers
+/// every realistic case.
+fn eval_static_int(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Value(v) => match &v.value {
+            ast::Value::Number(n, _) => n.parse::<i64>().ok(),
+            _ => None,
+        },
+        Expr::UnaryOp { op: ast::UnaryOperator::Minus, expr: inner } => {
+            eval_static_int(inner).map(|n| -n)
+        }
+        _ => None,
+    }
 }
 
 pub(super) fn contains_window_function(expr: &PlanExpr) -> bool {

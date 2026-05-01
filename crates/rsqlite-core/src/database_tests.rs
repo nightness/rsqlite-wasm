@@ -5846,6 +5846,123 @@
     }
 
     #[test]
+    fn window_frame_running_sum_default() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3), (4)").unwrap();
+        // With ORDER BY and no explicit frame, SQLite default is
+        // RANGE UNBOUNDED PRECEDING TO CURRENT ROW (running sum).
+        let r = db
+            .query("SELECT n, SUM(n) OVER (ORDER BY n) FROM t ORDER BY n")
+            .unwrap();
+        assert_eq!(r.rows.len(), 4);
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(1));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Integer(3));
+        assert_eq!(r.rows[2].values[1], crate::types::Value::Integer(6));
+        assert_eq!(r.rows[3].values[1], crate::types::Value::Integer(10));
+    }
+
+    #[test]
+    fn window_frame_rows_between_preceding_current() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (10), (20), (30), (40), (50)").unwrap();
+        // Sliding sum over current and 1 preceding row.
+        let r = db
+            .query("SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t ORDER BY n")
+            .unwrap();
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(10));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Integer(30));
+        assert_eq!(r.rows[2].values[1], crate::types::Value::Integer(50));
+        assert_eq!(r.rows[3].values[1], crate::types::Value::Integer(70));
+        assert_eq!(r.rows[4].values[1], crate::types::Value::Integer(90));
+    }
+
+    #[test]
+    fn window_frame_rows_unbounded_both() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+        let r = db
+            .query("SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM t ORDER BY n")
+            .unwrap();
+        for row in &r.rows {
+            assert_eq!(row.values[1], crate::types::Value::Integer(6));
+        }
+    }
+
+    #[test]
+    fn window_frame_rows_current_to_following() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1), (2), (3), (4)").unwrap();
+        // Sum of current row + next row.
+        let r = db
+            .query("SELECT n, SUM(n) OVER (ORDER BY n ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) FROM t ORDER BY n")
+            .unwrap();
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(3)); // 1+2
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Integer(5)); // 2+3
+        assert_eq!(r.rows[2].values[1], crate::types::Value::Integer(7)); // 3+4
+        assert_eq!(r.rows[3].values[1], crate::types::Value::Integer(4)); // 4 (no following)
+    }
+
+    #[test]
+    fn window_frame_default_with_peers() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (g INTEGER, v INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (1, 20), (2, 30), (2, 40)").unwrap();
+        // Default RANGE frame: peer rows (same ORDER BY value) get the same
+        // running sum because the frame extends through all peers.
+        let r = db
+            .query("SELECT g, SUM(v) OVER (ORDER BY g) FROM t ORDER BY g, v")
+            .unwrap();
+        // (g=1, peers): both rows see sum 10+20 = 30
+        // (g=2, peers): both see 30 + 40 + previous = 30+30+40 = 100
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(30));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Integer(30));
+        assert_eq!(r.rows[2].values[1], crate::types::Value::Integer(100));
+        assert_eq!(r.rows[3].values[1], crate::types::Value::Integer(100));
+    }
+
+    #[test]
+    fn window_frame_preserves_partition() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (g TEXT, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES ('a', 1), ('a', 2), ('b', 10), ('b', 20)").unwrap();
+        // Running sum, but partitioned by g — frames don't cross partitions.
+        let r = db
+            .query("SELECT g, n, SUM(n) OVER (PARTITION BY g ORDER BY n) FROM t ORDER BY g, n")
+            .unwrap();
+        assert_eq!(r.rows[0].values[2], crate::types::Value::Integer(1));
+        assert_eq!(r.rows[1].values[2], crate::types::Value::Integer(3));
+        assert_eq!(r.rows[2].values[2], crate::types::Value::Integer(10));
+        assert_eq!(r.rows[3].values[2], crate::types::Value::Integer(30));
+    }
+
+    #[test]
+    fn window_frame_avg_sliding() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (10), (20), (30), (40), (50)").unwrap();
+        let r = db
+            .query("SELECT n, AVG(n) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t ORDER BY n")
+            .unwrap();
+        // Window of 3 (or 2 at edges): avg(10,20)=15, avg(10,20,30)=20, avg(20,30,40)=30, avg(30,40,50)=40, avg(40,50)=45
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Real(15.0));
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Real(20.0));
+        assert_eq!(r.rows[2].values[1], crate::types::Value::Real(30.0));
+        assert_eq!(r.rows[3].values[1], crate::types::Value::Real(40.0));
+        assert_eq!(r.rows[4].values[1], crate::types::Value::Real(45.0));
+    }
+
+    #[test]
     fn default_persists_across_reopen() {
         let db_path = "/tmp/rsqlite_db_default_persist.db";
         let _ = std::fs::remove_file(db_path);

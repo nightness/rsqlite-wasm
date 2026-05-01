@@ -4,7 +4,7 @@ use rsqlite_storage::pager::Pager;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::eval_helpers::compare;
-use crate::planner::{Plan, PlanExpr};
+use crate::planner::{FrameBound, FrameUnits, Plan, PlanExpr, WindowFrameSpec};
 use crate::types::{QueryResult, Row};
 
 pub(super) fn execute_window(
@@ -19,7 +19,7 @@ pub(super) fn execute_window(
     let mut rows: Vec<Vec<Value>> = inner.rows.iter().map(|r| r.values.clone()).collect();
 
     for (win_expr, _alias) in window_exprs {
-        if let PlanExpr::WindowFunction { func_name, args, partition_by, order_by } = win_expr {
+        if let PlanExpr::WindowFunction { func_name, args, partition_by, order_by, frame } = win_expr {
             let partitions = partition_rows(&rows, partition_by, input_columns, output_columns, pager, catalog)?;
 
             let mut result_values: Vec<Value> = vec![Value::Null; rows.len()];
@@ -30,7 +30,7 @@ pub(super) fn execute_window(
                 }
 
                 compute_window_for_partition(
-                    func_name, args, order_by, &partition_indices, &rows,
+                    func_name, args, order_by, frame.as_ref(), &partition_indices, &rows,
                     input_columns, output_columns,
                     &mut result_values, pager, catalog,
                 )?;
@@ -132,6 +132,7 @@ fn compute_window_for_partition(
     func_name: &str,
     args: &[PlanExpr],
     order_by: &[(PlanExpr, bool)],
+    frame: Option<&WindowFrameSpec>,
     partition_indices: &[usize],
     rows: &[Vec<Value>],
     input_columns: &[String],
@@ -278,89 +279,65 @@ fn compute_window_for_partition(
             let arg = args.first();
             let is_count_star = arg.is_none() || matches!(arg, Some(PlanExpr::Wildcard));
 
-            let mut agg_values: Vec<Value> = Vec::new();
-            for &row_idx in partition_indices {
-                if is_count_star {
-                    agg_values.push(Value::Integer(1));
-                } else if let Some(arg_expr) = arg {
-                    let tmp_row = Row { values: rows[row_idx].clone() };
-                    let val = super::eval::eval_expr(arg_expr, &tmp_row, cols, pager, catalog)?;
-                    if !matches!(val, Value::Null) {
-                        agg_values.push(val);
+            // Pre-compute one Value per partition row (NULL for filtered).
+            let row_values: Vec<Option<Value>> = partition_indices
+                .iter()
+                .map(|&row_idx| -> Result<Option<Value>> {
+                    if is_count_star {
+                        Ok(Some(Value::Integer(1)))
+                    } else if let Some(arg_expr) = arg {
+                        let tmp_row = Row { values: rows[row_idx].clone() };
+                        let val = super::eval::eval_expr(arg_expr, &tmp_row, cols, pager, catalog)?;
+                        if matches!(val, Value::Null) {
+                            Ok(None)
+                        } else {
+                            Ok(Some(val))
+                        }
+                    } else {
+                        Ok(None)
                     }
-                }
-            }
+                })
+                .collect::<Result<_>>()?;
 
-            let result = match func_name {
-                "COUNT" => Value::Integer(agg_values.len() as i64),
-                "SUM" => {
-                    if agg_values.is_empty() {
-                        Value::Null
-                    } else {
-                        let mut sum_i: i64 = 0;
-                        let mut sum_f: f64 = 0.0;
-                        let mut is_real = false;
-                        for v in &agg_values {
-                            match v {
-                                Value::Integer(n) => sum_i += n,
-                                Value::Real(f) => { sum_f += f; is_real = true; }
-                                _ => {}
-                            }
-                        }
-                        if is_real { Value::Real(sum_f + sum_i as f64) } else { Value::Integer(sum_i) }
-                    }
-                }
-                "TOTAL" => {
-                    let mut total: f64 = 0.0;
-                    for v in &agg_values {
-                        match v {
-                            Value::Integer(n) => total += *n as f64,
-                            Value::Real(f) => total += f,
-                            _ => {}
-                        }
-                    }
-                    Value::Real(total)
-                }
-                "AVG" => {
-                    if agg_values.is_empty() {
-                        Value::Null
-                    } else {
-                        let mut sum: f64 = 0.0;
-                        for v in &agg_values {
-                            match v {
-                                Value::Integer(n) => sum += *n as f64,
-                                Value::Real(f) => sum += f,
-                                _ => {}
-                            }
-                        }
-                        Value::Real(sum / agg_values.len() as f64)
-                    }
-                }
-                "MIN" => {
-                    if agg_values.is_empty() { Value::Null }
-                    else {
-                        let mut min = agg_values[0].clone();
-                        for v in &agg_values[1..] {
-                            if compare(v, &min) < 0 { min = v.clone(); }
-                        }
-                        min
-                    }
-                }
-                "MAX" => {
-                    if agg_values.is_empty() { Value::Null }
-                    else {
-                        let mut max = agg_values[0].clone();
-                        for v in &agg_values[1..] {
-                            if compare(v, &max) > 0 { max = v.clone(); }
-                        }
-                        max
-                    }
-                }
-                _ => Value::Null,
+            // Pre-compute order keys for each row in the partition (used by
+            // RANGE/default frame and peer detection).
+            let order_keys: Vec<Vec<Value>> = if order_by.is_empty() {
+                vec![Vec::new(); partition_len]
+            } else {
+                partition_indices
+                    .iter()
+                    .map(|&row_idx| -> Result<Vec<Value>> {
+                        let tmp_row = Row { values: rows[row_idx].clone() };
+                        order_by
+                            .iter()
+                            .map(|(expr, _)| {
+                                super::eval::eval_expr(expr, &tmp_row, cols, pager, catalog)
+                            })
+                            .collect()
+                    })
+                    .collect::<Result<_>>()?
             };
 
-            for &row_idx in partition_indices {
-                result_values[row_idx] = result.clone();
+            // For each row in the partition, compute the frame [start, end]
+            // (inclusive) and aggregate over that slice.
+            for (i, &row_idx) in partition_indices.iter().enumerate() {
+                let (start, end) = compute_frame_bounds(
+                    i,
+                    partition_len,
+                    frame,
+                    order_by,
+                    &order_keys,
+                );
+
+                let mut agg_values: Vec<Value> = Vec::new();
+                for j in start..=end {
+                    if let Some(v) = &row_values[j] {
+                        agg_values.push(v.clone());
+                    }
+                }
+
+                let result = aggregate_values(func_name, &agg_values);
+                result_values[row_idx] = result;
             }
         }
         _ => {
@@ -368,4 +345,182 @@ fn compute_window_for_partition(
         }
     }
     Ok(())
+}
+
+/// Compute the inclusive [start, end] frame bounds for the row at position
+/// `i` within the partition. Returns (start, end) as 0-based indices into
+/// the partition.
+///
+/// SQLite's default frame when ORDER BY is present and no explicit frame is
+/// given: RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW (inclusive of
+/// peers). When ORDER BY is absent and no frame: the whole partition.
+fn compute_frame_bounds(
+    i: usize,
+    partition_len: usize,
+    frame: Option<&WindowFrameSpec>,
+    order_by: &[(PlanExpr, bool)],
+    order_keys: &[Vec<Value>],
+) -> (usize, usize) {
+    let last = partition_len.saturating_sub(1);
+    match frame {
+        None => {
+            if order_by.is_empty() {
+                (0, last)
+            } else {
+                // Default RANGE UNBOUNDED PRECEDING TO CURRENT ROW: include
+                // all peers (rows with the same ORDER BY key) at position i.
+                let end = peer_group_end(i, order_keys);
+                (0, end)
+            }
+        }
+        Some(spec) => {
+            let start = resolve_bound(&spec.start, i, last, &spec.units, order_keys, true);
+            let end = resolve_bound(&spec.end, i, last, &spec.units, order_keys, false);
+            // Guard: empty/inverted frames -> use just the current row.
+            if start > end {
+                (i, i)
+            } else {
+                (start.min(last), end.min(last))
+            }
+        }
+    }
+}
+
+fn resolve_bound(
+    bound: &FrameBound,
+    i: usize,
+    last: usize,
+    units: &FrameUnits,
+    order_keys: &[Vec<Value>],
+    is_start: bool,
+) -> usize {
+    match bound {
+        FrameBound::UnboundedPreceding => 0,
+        FrameBound::UnboundedFollowing => last,
+        FrameBound::CurrentRow => match units {
+            FrameUnits::Range | FrameUnits::Groups => {
+                if is_start {
+                    peer_group_start(i, order_keys)
+                } else {
+                    peer_group_end(i, order_keys)
+                }
+            }
+            FrameUnits::Rows => i,
+        },
+        FrameBound::Preceding(n) => {
+            let n = *n as usize;
+            i.saturating_sub(n)
+        }
+        FrameBound::Following(n) => {
+            let n = *n as usize;
+            (i + n).min(last)
+        }
+    }
+}
+
+fn peer_group_start(i: usize, order_keys: &[Vec<Value>]) -> usize {
+    if order_keys.is_empty() || order_keys[i].is_empty() {
+        return 0;
+    }
+    let key = &order_keys[i];
+    let mut s = i;
+    while s > 0 && order_keys[s - 1] == *key {
+        s -= 1;
+    }
+    s
+}
+
+fn peer_group_end(i: usize, order_keys: &[Vec<Value>]) -> usize {
+    if order_keys.is_empty() || order_keys[i].is_empty() {
+        return order_keys.len().saturating_sub(1);
+    }
+    let key = &order_keys[i];
+    let mut e = i;
+    while e + 1 < order_keys.len() && order_keys[e + 1] == *key {
+        e += 1;
+    }
+    e
+}
+
+fn aggregate_values(func_name: &str, agg_values: &[Value]) -> Value {
+    match func_name {
+        "COUNT" => Value::Integer(agg_values.len() as i64),
+        "SUM" => {
+            if agg_values.is_empty() {
+                Value::Null
+            } else {
+                let mut sum_i: i64 = 0;
+                let mut sum_f: f64 = 0.0;
+                let mut is_real = false;
+                for v in agg_values {
+                    match v {
+                        Value::Integer(n) => sum_i += n,
+                        Value::Real(f) => {
+                            sum_f += f;
+                            is_real = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if is_real {
+                    Value::Real(sum_f + sum_i as f64)
+                } else {
+                    Value::Integer(sum_i)
+                }
+            }
+        }
+        "TOTAL" => {
+            let mut total: f64 = 0.0;
+            for v in agg_values {
+                match v {
+                    Value::Integer(n) => total += *n as f64,
+                    Value::Real(f) => total += f,
+                    _ => {}
+                }
+            }
+            Value::Real(total)
+        }
+        "AVG" => {
+            if agg_values.is_empty() {
+                Value::Null
+            } else {
+                let mut sum: f64 = 0.0;
+                for v in agg_values {
+                    match v {
+                        Value::Integer(n) => sum += *n as f64,
+                        Value::Real(f) => sum += f,
+                        _ => {}
+                    }
+                }
+                Value::Real(sum / agg_values.len() as f64)
+            }
+        }
+        "MIN" => {
+            if agg_values.is_empty() {
+                Value::Null
+            } else {
+                let mut min = agg_values[0].clone();
+                for v in &agg_values[1..] {
+                    if compare(v, &min) < 0 {
+                        min = v.clone();
+                    }
+                }
+                min
+            }
+        }
+        "MAX" => {
+            if agg_values.is_empty() {
+                Value::Null
+            } else {
+                let mut max = agg_values[0].clone();
+                for v in &agg_values[1..] {
+                    if compare(v, &max) > 0 {
+                        max = v.clone();
+                    }
+                }
+                max
+            }
+        }
+        _ => Value::Null,
+    }
 }
