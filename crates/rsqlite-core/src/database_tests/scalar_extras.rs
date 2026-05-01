@@ -1183,6 +1183,100 @@ fn series_module_rejects_insert() {
     assert!(res.is_err());
 }
 
+// ── vec_index virtual table (typed vector storage) ───────────────────
+
+#[test]
+fn vec_index_create_and_insert_round_trip() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE embeds USING vec_index(dim=3, metric=cosine)")
+        .unwrap();
+
+    let v1 = vec_blob(&[1.0, 0.0, 0.0]);
+    let v2 = vec_blob(&[0.0, 1.0, 0.0]);
+    db.execute_with_params("INSERT INTO embeds VALUES (?)", vec![v1.clone()])
+        .unwrap();
+    db.execute_with_params("INSERT INTO embeds VALUES (?)", vec![v2.clone()])
+        .unwrap();
+
+    let r = db.query("SELECT rowid, vector FROM embeds ORDER BY rowid").unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0].values[0], Value::Integer(1));
+    assert_eq!(r.rows[0].values[1], v1);
+    assert_eq!(r.rows[1].values[0], Value::Integer(2));
+    assert_eq!(r.rows[1].values[1], v2);
+}
+
+#[test]
+fn vec_index_brute_force_nearest_neighbor_via_sql() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE e USING vec_index(dim=3)").unwrap();
+    db.execute_with_params(
+        "INSERT INTO e VALUES (?)",
+        vec![vec_blob(&[1.0, 0.0, 0.0])],
+    )
+    .unwrap();
+    db.execute_with_params(
+        "INSERT INTO e VALUES (?)",
+        vec![vec_blob(&[0.0, 1.0, 0.0])],
+    )
+    .unwrap();
+    db.execute_with_params(
+        "INSERT INTO e VALUES (?)",
+        vec![vec_blob(&[0.0, 0.0, 1.0])],
+    )
+    .unwrap();
+
+    // The user composes a brute-force nearest-neighbor query over the
+    // vec_index table using the existing vec_distance scalar function.
+    let r = db
+        .query_with_params(
+            "SELECT rowid, vec_distance_cosine(vector, ?) AS d \
+             FROM e ORDER BY d LIMIT 1",
+            vec![vec_blob(&[0.9, 0.1, 0.0])],
+        )
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(1));
+}
+
+#[test]
+fn vec_index_rejects_dimension_mismatch_at_insert() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE e USING vec_index(dim=3)").unwrap();
+    let res = db.execute_with_params(
+        "INSERT INTO e VALUES (?)",
+        vec![vec_blob(&[1.0, 0.0])],
+    );
+    assert!(res.is_err());
+}
+
+#[test]
+fn vec_index_create_rejects_missing_dim_arg() {
+    let mut db = fresh();
+    let res = db.execute("CREATE VIRTUAL TABLE e USING vec_index()");
+    assert!(res.is_err());
+}
+
+#[test]
+fn vec_index_supports_l2_metric() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE e USING vec_index(dim=2, metric=l2)")
+        .unwrap();
+    db.execute_with_params("INSERT INTO e VALUES (?)", vec![vec_blob(&[3.0, 4.0])])
+        .unwrap();
+    let r = db
+        .query_with_params(
+            "SELECT vec_distance_l2(vector, ?) FROM e",
+            vec![vec_blob(&[0.0, 0.0])],
+        )
+        .unwrap();
+    if let Value::Real(d) = r.rows[0].values[0] {
+        assert!((d - 5.0).abs() < 1e-5, "expected 5.0, got {d}");
+    } else {
+        panic!("expected real distance");
+    }
+}
+
 // ── Multi-column expression-index lookup ─────────────────────────────
 
 #[test]

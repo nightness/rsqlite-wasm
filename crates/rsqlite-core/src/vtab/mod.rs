@@ -25,6 +25,8 @@ use std::rc::Rc;
 
 use rsqlite_storage::codec::Value;
 
+mod vec_index;
+
 use crate::error::Result;
 use crate::types::Row;
 
@@ -79,6 +81,7 @@ fn default_modules() -> HashMap<String, Rc<dyn Module>> {
     map.insert("series".to_string(), series.clone());
     map.insert("generate_series".to_string(), series);
     map.insert("kvstore".to_string(), Rc::new(KvStoreModule));
+    map.insert("vec_index".to_string(), Rc::new(vec_index::VecIndexModule));
     map
 }
 

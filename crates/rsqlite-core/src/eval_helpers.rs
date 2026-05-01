@@ -1097,7 +1097,7 @@ pub(crate) fn numeric_op(
     }
 }
 
-fn blob_to_f32_vec(blob: &[u8]) -> Result<Vec<f32>> {
+pub(crate) fn blob_to_f32_vec(blob: &[u8]) -> Result<Vec<f32>> {
     if blob.len() % 4 != 0 {
         return Err(Error::Other(
             "vector BLOB length must be a multiple of 4 bytes".into(),
@@ -1140,7 +1140,7 @@ fn blob_pair_to_f32(args: &[Value]) -> Result<(Vec<f32>, Vec<f32>)> {
     Ok((v1, v2))
 }
 
-fn cosine_distance(v1: &[f32], v2: &[f32]) -> f64 {
+pub(crate) fn cosine_distance(v1: &[f32], v2: &[f32]) -> f64 {
     let dot: f64 = v1
         .iter()
         .zip(v2)
@@ -1162,7 +1162,7 @@ fn cosine_distance(v1: &[f32], v2: &[f32]) -> f64 {
     1.0 - (dot / (norm1 * norm2))
 }
 
-fn l2_distance(v1: &[f32], v2: &[f32]) -> f64 {
+pub(crate) fn l2_distance(v1: &[f32], v2: &[f32]) -> f64 {
     v1.iter()
         .zip(v2)
         .map(|(a, b)| {

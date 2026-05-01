@@ -97,11 +97,18 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 
 ## Not implemented at all
 
-- **FTS5 / R-Tree / HNSW** — the virtual-table foundation
-  (`crate::vtab`) is in place, including a built-in `series` /
-  `generate_series` module and CREATE VIRTUAL TABLE wiring. The
-  specific search modules are deferred to v0.2; third parties can
-  register modules today via `vtab::register_module`.
+- **Vector index `vec_index`** — typed vector storage shipped as a
+  built-in virtual-table module (`CREATE VIRTUAL TABLE e USING
+  vec_index(dim=N, metric=cosine|l2|dot)`). Inserts validate the
+  vector dimension. Lookup is brute-force for v0.1 — the user
+  composes a nearest-neighbor query as
+  `SELECT rowid FROM e ORDER BY vec_distance_cosine(vector, ?)
+  LIMIT k`. Swapping in a real HNSW graph behind the same API is
+  a v0.2 perf optimization.
+- **FTS5 / R-Tree** — the virtual-table foundation (`crate::vtab`)
+  is in place; the specific search modules are deferred to v0.2.
+  Third parties can register modules today via
+  `vtab::register_module`.
 - **`LOAD_EXTENSION`** — not safe in WASM.
 - **User-defined functions** from JavaScript — supported in the
   in-worker `Database` API via `db.createFunction(name, fn, opts)`. Not
@@ -115,8 +122,8 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 These are tracked as v0.2 candidates:
 
 1. sqlite_schema root-page split (btree restructure).
-4. Partial-index implication beyond the verbatim-conjunct case
-   (e.g. tighter range proves looser range).
-5. FTS5 / R-Tree / HNSW vector index modules — the vtab foundation
-   exists, but these specific modules are deferred to v0.2.
-6. WITHOUT ROWID tables — storage layer rewrite deferred to v0.2.
+2. Partial-index implication beyond the verbatim-conjunct + literal
+   range cases (e.g. semantic implication of two `IN` lists).
+3. FTS5 / R-Tree modules + real HNSW graph (the brute-force
+   `vec_index` shipped today is API-shaped for the swap).
+4. WITHOUT ROWID tables — storage layer rewrite deferred to v0.2.
