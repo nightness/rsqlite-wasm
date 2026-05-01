@@ -165,6 +165,16 @@ pub struct IndexStat {
     pub avg_per_prefix: Vec<i64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VirtualTableDef {
+    pub name: String,
+    pub module: String,
+    /// Comma-separated arguments from `CREATE VIRTUAL TABLE … USING
+    /// module(<args>)`. Stored verbatim and re-split per-instance so
+    /// modules with quoted arguments stay intact.
+    pub args: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     pub tables: HashMap<String, TableDef>,
@@ -175,6 +185,10 @@ pub struct Catalog {
     /// `sqlite_stat1` at catalog-load time and refreshed by ANALYZE.
     /// Empty when `sqlite_stat1` doesn't exist or is empty.
     pub index_stats: HashMap<String, IndexStat>,
+    /// Virtual-table definitions keyed by lowercased table name.
+    /// Live in-process only — virtual tables don't currently round-trip
+    /// through the on-disk schema; they're re-registered each session.
+    pub virtual_tables: HashMap<String, VirtualTableDef>,
 }
 
 impl Catalog {
@@ -227,6 +241,7 @@ impl Catalog {
             views,
             triggers,
             index_stats,
+            virtual_tables: HashMap::new(),
         })
     }
 

@@ -180,6 +180,24 @@ pub enum Plan {
         root_page: u32,
         columns: Vec<ColumnRef>,
     },
+    /// Materialize a virtual table by invoking its module's scan method.
+    /// Filters are NOT pushed down — the surrounding plan wraps the
+    /// result in a Filter for any WHERE clause. (xBestIndex is a v0.2
+    /// optimization.)
+    VirtualScan {
+        table: String,
+        module: String,
+        args: Vec<String>,
+        columns: Vec<ColumnRef>,
+    },
+    /// Register a new virtual table in the catalog. The module must be
+    /// registered in the vtab module registry.
+    CreateVirtualTable {
+        name: String,
+        module: String,
+        args: Vec<String>,
+        if_not_exists: bool,
+    },
     IndexScan {
         table: String,
         table_root_page: u32,
@@ -461,6 +479,37 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
                 }
                 return Err(Error::Other("invalid DROP TRIGGER syntax".to_string()));
             }
+            if pragma_name == "__create_virtual_table" {
+                if let Some(val) = &value {
+                    let encoded = match val {
+                        ast::Value::SingleQuotedString(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    let parts: Vec<&str> = encoded.splitn(4, '|').collect();
+                    if parts.len() == 4 {
+                        let if_not_exists = parts[0] == "1";
+                        let name = parts[1].to_string();
+                        let module = parts[2].to_string();
+                        let args = if parts[3].is_empty() {
+                            Vec::new()
+                        } else {
+                            parts[3]
+                                .split(',')
+                                .map(|s| s.trim().to_string())
+                                .collect()
+                        };
+                        return Ok(Plan::CreateVirtualTable {
+                            name,
+                            module,
+                            args,
+                            if_not_exists,
+                        });
+                    }
+                }
+                return Err(Error::Other(
+                    "invalid CREATE VIRTUAL TABLE syntax".to_string(),
+                ));
+            }
             if pragma_name == "__detach" {
                 if let Some(val) = &value {
                     let schema_name = match val {
@@ -608,6 +657,43 @@ fn resolve_table_factor(
 
             if let Some(view_def) = catalog.get_view(&table_name) {
                 return resolve_view(&view_def.sql, &table_name, alias, catalog);
+            }
+
+            if let Some(vt) = catalog.virtual_tables.get(&table_name.to_lowercase()) {
+                let prefix = alias
+                    .as_ref()
+                    .map(|a| a.name.value.clone())
+                    .unwrap_or_else(|| vt.name.clone());
+                // Ask the module for its column shape — virtual tables don't
+                // store columns in `sqlite_schema`, so we re-instantiate.
+                let module = crate::vtab::lookup_module(&vt.module).ok_or_else(|| {
+                    Error::Other(format!(
+                        "virtual-table module not registered: {}",
+                        vt.module
+                    ))
+                })?;
+                let probe = module.create(&vt.name, &vt.args)?;
+                let columns: Vec<ColumnRef> = probe
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| ColumnRef {
+                        name: name.clone(),
+                        column_index: i,
+                        is_rowid_alias: false,
+                        table: Some(prefix.clone()),
+                        nullable: true,
+                        is_primary_key: false,
+                        is_unique: false,
+                    })
+                    .collect();
+                let plan = Plan::VirtualScan {
+                    table: vt.name.clone(),
+                    module: vt.module.clone(),
+                    args: vt.args.clone(),
+                    columns: columns.clone(),
+                };
+                return Ok((plan, columns));
             }
 
             Err(Error::Other(format!("table not found: {table_name}")))

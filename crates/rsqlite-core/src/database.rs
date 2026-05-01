@@ -151,6 +151,7 @@ impl Database {
                 | Plan::Vacuum
                 | Plan::CreateTrigger { .. }
                 | Plan::DropTrigger { .. }
+                | Plan::CreateVirtualTable { .. }
         );
         let result = executor::execute_mut(&plan, &mut self.pager, &mut self.catalog)?;
         if is_ddl {

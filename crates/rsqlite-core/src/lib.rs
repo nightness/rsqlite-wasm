@@ -21,3 +21,4 @@ pub(crate) mod json;
 pub mod planner;
 pub mod types;
 pub mod udf;
+pub mod vtab;

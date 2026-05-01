@@ -311,6 +311,12 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             window_exprs,
             output_columns,
         } => execute_window(input, window_exprs, output_columns, pager, catalog),
+        Plan::VirtualScan {
+            module,
+            args,
+            columns,
+            ..
+        } => execute_virtual_scan(module, args, columns),
         Plan::CreateTable(_)
         | Plan::CreateIndex(_)
         | Plan::Insert(_)
@@ -335,10 +341,62 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
         | Plan::CreateTrigger { .. }
         | Plan::DropTrigger { .. }
         | Plan::AttachDatabase { .. }
-        | Plan::DetachDatabase { .. } => Err(Error::Other(
+        | Plan::DetachDatabase { .. }
+        | Plan::CreateVirtualTable { .. } => Err(Error::Other(
             "use execute_mut for DDL/DML statements".to_string(),
         )),
     }
+}
+
+fn execute_virtual_scan(
+    module: &str,
+    args: &[String],
+    columns: &[crate::planner::ColumnRef],
+) -> Result<QueryResult> {
+    let module_def = crate::vtab::lookup_module(module).ok_or_else(|| {
+        Error::Other(format!("virtual-table module not registered: {module}"))
+    })?;
+    let table = module_def.create("", args)?;
+    let rows = table.scan()?;
+    let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    Ok(QueryResult {
+        columns: column_names,
+        rows,
+    })
+}
+
+fn execute_create_virtual_table(
+    name: &str,
+    module: &str,
+    args: &[String],
+    if_not_exists: bool,
+    catalog: &mut Catalog,
+) -> Result<ExecResult> {
+    let key = name.to_lowercase();
+    if catalog.virtual_tables.contains_key(&key) {
+        if if_not_exists {
+            return Ok(ExecResult::affected(0));
+        }
+        return Err(Error::Other(format!("virtual table {name} already exists")));
+    }
+    // Verify the module is registered up front so the failure surfaces
+    // at CREATE time instead of every query that touches the table.
+    let module_def = crate::vtab::lookup_module(module).ok_or_else(|| {
+        Error::Other(format!("virtual-table module not registered: {module}"))
+    })?;
+    // Probe the args by doing a one-shot create + drop. This catches
+    // arg-shape errors (wrong count, non-numeric where numeric expected)
+    // at registration time.
+    let _probe = module_def.create(name, args)?;
+    catalog.virtual_tables.insert(
+        key,
+        crate::catalog::VirtualTableDef {
+            name: name.to_string(),
+            module: module.to_string(),
+            args: args.to_vec(),
+        },
+    );
+    Ok(ExecResult::affected(0))
 }
 
 pub fn execute_mut(plan: &Plan, pager: &mut Pager, catalog: &mut Catalog) -> Result<ExecResult> {
@@ -376,6 +434,12 @@ pub fn execute_mut(plan: &Plan, pager: &mut Pager, catalog: &mut Catalog) -> Res
             query,
         } => execute_create_table_as_select(table_name, *if_not_exists, query, pager, catalog),
         Plan::Vacuum => execute_vacuum(pager, catalog),
+        Plan::CreateVirtualTable {
+            name,
+            module,
+            args,
+            if_not_exists,
+        } => execute_create_virtual_table(name, module, args, *if_not_exists, catalog),
         // REINDEX is currently a no-op: our btree implementation doesn't
         // suffer from the corruption modes (collation changes, etc.) that
         // real SQLite addresses with REINDEX. Accepted for tool compat.

@@ -999,6 +999,78 @@ fn bare_rowid_filter_without_alias() {
     assert_eq!(r.rows[0].values[0], Value::Text("second".to_string()));
 }
 
+// ── Virtual tables (CREATE VIRTUAL TABLE / SELECT FROM vtab) ─────────
+
+#[test]
+fn create_virtual_table_with_series_module() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE s USING series(1, 5)").unwrap();
+    let r = db.query("SELECT value FROM s ORDER BY value").unwrap();
+    assert_eq!(r.rows.len(), 5);
+    let vals: Vec<i64> = r
+        .rows
+        .iter()
+        .filter_map(|row| {
+            if let Value::Integer(n) = row.values[0] {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(vals, vec![1, 2, 3, 4, 5]);
+}
+
+#[test]
+fn virtual_table_supports_where_clause() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE s USING series(1, 10)").unwrap();
+    let r = db
+        .query("SELECT value FROM s WHERE value > 7 ORDER BY value")
+        .unwrap();
+    let vals: Vec<i64> = r
+        .rows
+        .iter()
+        .filter_map(|row| {
+            if let Value::Integer(n) = row.values[0] {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(vals, vec![8, 9, 10]);
+}
+
+#[test]
+fn create_virtual_table_with_three_args() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE evens USING series(0, 10, 2)")
+        .unwrap();
+    let r = db.query("SELECT COUNT(*) FROM evens").unwrap();
+    // 0, 2, 4, 6, 8, 10 → 6 rows
+    assert_eq!(r.rows[0].values[0], Value::Integer(6));
+}
+
+#[test]
+fn create_virtual_table_unknown_module_errors() {
+    let mut db = fresh();
+    let res = db.execute("CREATE VIRTUAL TABLE x USING nope_module(1, 2)");
+    assert!(res.is_err(), "expected error for unknown module");
+}
+
+#[test]
+fn create_virtual_table_if_not_exists_skips_duplicate() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE s USING series(1, 3)").unwrap();
+    // First create succeeds; second errors without IF NOT EXISTS.
+    let dup = db.execute("CREATE VIRTUAL TABLE s USING series(1, 3)");
+    assert!(dup.is_err());
+    // With IF NOT EXISTS the duplicate is a no-op.
+    db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS s USING series(1, 3)")
+        .unwrap();
+}
+
 // ── Multi-column expression-index lookup ─────────────────────────────
 
 #[test]

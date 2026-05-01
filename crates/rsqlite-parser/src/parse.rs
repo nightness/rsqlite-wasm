@@ -23,8 +23,74 @@ pub fn parse_sql(sql: &str) -> Result<Vec<sqlparser::ast::Statement>, ParseError
     if let Some(stmt) = parse_detach_statement(&preprocessed) {
         return Ok(vec![stmt]);
     }
+    if let Some(stmt) = parse_create_virtual_table(&preprocessed) {
+        return Ok(vec![stmt]);
+    }
     let statements = Parser::parse_sql(&dialect, &preprocessed)?;
     Ok(statements)
+}
+
+/// Detect `CREATE VIRTUAL TABLE [IF NOT EXISTS] <name> USING <module>(args…)`
+/// and emit a `PRAGMA __create_virtual_table('<name>|<module>|<args>')` so
+/// the planner can route it to the vtab module registry. sqlparser's
+/// SQLiteDialect doesn't accept the syntax natively, and emulating it via a
+/// custom dialect would ripple through too much; the pragma channel matches
+/// what we already do for triggers.
+fn parse_create_virtual_table(sql: &str) -> Option<sqlparser::ast::Statement> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let upper = trimmed.to_uppercase();
+    let prefix = "CREATE VIRTUAL TABLE";
+    if !upper.starts_with(prefix) {
+        return None;
+    }
+    let rest = trimmed[prefix.len()..].trim_start();
+    let upper_rest = rest.to_uppercase();
+    let (rest, if_not_exists) = if upper_rest.starts_with("IF NOT EXISTS") {
+        (rest["IF NOT EXISTS".len()..].trim_start(), true)
+    } else {
+        (rest, false)
+    };
+
+    // Parse the table name (until whitespace).
+    let name_end = rest
+        .find(char::is_whitespace)
+        .unwrap_or(rest.len());
+    let name = rest[..name_end].trim_matches(|c: char| c == '"' || c == '`' || c == '[' || c == ']');
+    if name.is_empty() {
+        return None;
+    }
+    let after_name = rest[name_end..].trim_start();
+
+    // Expect `USING <module>(args)`.
+    let upper_after = after_name.to_uppercase();
+    if !upper_after.starts_with("USING") {
+        return None;
+    }
+    let after_using = after_name["USING".len()..].trim_start();
+    let paren = after_using.find('(')?;
+    let module = after_using[..paren].trim();
+    if module.is_empty() {
+        return None;
+    }
+    let close = after_using.rfind(')')?;
+    if close <= paren {
+        return None;
+    }
+    let raw_args = &after_using[paren + 1..close];
+
+    // Encode as `<if_not_exists>|<name>|<module>|<args>` so the planner
+    // can split on '|'.
+    let encoded = format!(
+        "{}|{}|{}|{}",
+        if if_not_exists { "1" } else { "0" },
+        name,
+        module,
+        raw_args
+    );
+    Some(make_pragma_statement(
+        "__create_virtual_table",
+        Some(&encoded),
+    ))
 }
 
 fn parse_trigger_statement(sql: &str) -> Option<sqlparser::ast::Statement> {

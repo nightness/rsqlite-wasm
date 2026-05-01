@@ -89,7 +89,11 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 
 ## Not implemented at all
 
-- **Virtual tables / FTS / R-Tree** — out of scope.
+- **FTS5 / R-Tree / HNSW** — the virtual-table foundation
+  (`crate::vtab`) is in place, including a built-in `series` /
+  `generate_series` module and CREATE VIRTUAL TABLE wiring. The
+  specific search modules are deferred to v0.2; third parties can
+  register modules today via `vtab::register_module`.
 - **`LOAD_EXTENSION`** — not safe in WASM.
 - **User-defined functions** from JavaScript — supported in the
   in-worker `Database` API via `db.createFunction(name, fn, opts)`. Not
@@ -110,6 +114,6 @@ These are tracked as v0.2 candidates:
    (single-identifier form already works via parser pre-pass).
 4. Partial-index implication beyond the verbatim-conjunct case
    (e.g. tighter range proves looser range).
-5. Virtual tables / FTS5 / R-Tree / HNSW vector index — major
-   subsystems deferred to v0.2.
+5. FTS5 / R-Tree / HNSW vector index modules — the vtab foundation
+   exists, but these specific modules are deferred to v0.2.
 6. WITHOUT ROWID tables — storage layer rewrite deferred to v0.2.
