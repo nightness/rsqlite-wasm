@@ -617,6 +617,12 @@ fn rewrite_shifts_one_pass(sql: &str) -> String {
 /// dropping trailing whitespace) — callers `out.truncate(start_index)`
 /// to lop off the atom, which incidentally also drops the trailing
 /// whitespace before the operator.
+///
+/// Returns None if the atom is preceded by a higher-precedence binary
+/// operator (`+ - * / % ||`). In SQLite, `<<`/`>>` bind looser than
+/// these — so capturing only the trailing atom (e.g. `b` in `a + b << c`)
+/// would silently produce the wrong tree. Bailing here keeps sqlparser
+/// to surface the original error instead.
 fn trailing_atom(out: &str) -> Option<(usize, String)> {
     let trimmed = out.trim_end();
     let bytes = trimmed.as_bytes();
@@ -669,6 +675,22 @@ fn trailing_atom(out: &str) -> Option<(usize, String)> {
                 start -= 1;
             } else {
                 break;
+            }
+        }
+        // Bail if a higher-precedence binary operator immediately precedes
+        // the atom — see doc comment above. Walk back through whitespace.
+        let mut k = start;
+        while k > 0 && (bytes[k - 1] as char).is_whitespace() {
+            k -= 1;
+        }
+        if k > 0 {
+            let prev = bytes[k - 1] as char;
+            // Watch for `||` (concat) — both bytes are `|`.
+            let prev2 = if k >= 2 { Some(bytes[k - 2] as char) } else { None };
+            let prev_op_higher_prec = matches!(prev, '+' | '-' | '*' | '/' | '%')
+                || (prev == '|' && prev2 == Some('|'));
+            if prev_op_higher_prec {
+                return None;
             }
         }
         let text = String::from_utf8_lossy(&bytes[start..n]).into_owned();
