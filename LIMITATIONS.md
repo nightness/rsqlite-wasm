@@ -19,14 +19,14 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
   `parse_infix` to accept the missing operator tokens directly.
 
 - **`x IS TRUE` / `x IS FALSE` / `x IS NOT TRUE` / `x IS NOT FALSE`.**
-  Not parseable as syntax. Use the function equivalents:
-  - `is_true(x)` — 1 when `x` is non-null and truthy, else 0
-  - `is_false(x)` — 1 when `x` is non-null and falsy, else 0
-  - `is_not_true(x)` — 1 when `x` is null or falsy
-  - `is_not_false(x)` — 1 when `x` is null or truthy
-
-  Truthiness follows SQLite semantics: NULL is unknown; integer/real != 0
-  is true; text is true if it parses as a non-zero number.
+  The syntax form is supported when `x` is a single identifier
+  (`col`, `t.col`, `"quoted col"`); the parser pre-pass rewrites it
+  into `(x IS NOT NULL AND x <> 0)` etc. before handing it to
+  SQLiteDialect. For arbitrary LHS expressions (`(a + b) IS TRUE`),
+  use the function form `is_true(...)` / `is_false(...)` /
+  `is_not_true(...)` / `is_not_false(...)` — semantics match SQLite's
+  truthiness rule (NULL is unknown; integer/real != 0 is true; text
+  is true if it parses as a non-zero number).
 
 ## Schema
 
@@ -105,8 +105,8 @@ These are tracked as v0.2 candidates:
 4. sqlite_schema root-page split (btree restructure)
 5. Native bitwise operator syntax (`<<`, `>>`, `~`) — currently only the
    `__shl`, `__shr`, `__bnot` function forms work.
-6. `IS TRUE` / `IS FALSE` as syntax — currently only the `is_true()`,
-   `is_false()`, `is_not_true()`, `is_not_false()` function forms work.
+6. `IS TRUE` / `IS FALSE` syntax with arbitrary expression LHS
+   (single-identifier form already works via parser pre-pass).
 7. Partial-index implication beyond the verbatim-conjunct case
    (e.g. tighter range proves looser range).
 8. Cost-aware planner consuming the `sqlite_stat1` rows ANALYZE writes.

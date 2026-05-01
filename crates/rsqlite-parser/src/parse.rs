@@ -5,7 +5,7 @@ use crate::error::ParseError;
 
 pub fn parse_sql(sql: &str) -> Result<Vec<sqlparser::ast::Statement>, ParseError> {
     let dialect = SQLiteDialect {};
-    let preprocessed = preprocess_pragma(sql);
+    let preprocessed = preprocess_is_truth_family(&preprocess_pragma(sql));
     if is_vacuum(&preprocessed) {
         return Ok(vec![make_pragma_statement("__vacuum", None)]);
     }
@@ -219,6 +219,211 @@ fn make_pragma_statement(name: &str, value: Option<&str>) -> sqlparser::ast::Sta
         value: value.map(|v| Value::SingleQuotedString(v.to_string())),
         is_eq: value.is_some(),
     }
+}
+
+/// Translate `<ident> IS [NOT] TRUE/FALSE` into the SQLite-equivalent
+/// boolean form so SQLiteDialect (which rejects the syntax) accepts it:
+///
+/// - `x IS TRUE` → `(x IS NOT NULL AND x <> 0)`
+/// - `x IS FALSE` → `(x IS NOT NULL AND x = 0)`
+/// - `x IS NOT TRUE` → `(x IS NULL OR x = 0)`
+/// - `x IS NOT FALSE` → `(x IS NULL OR x <> 0)`
+///
+/// Only matches when the LHS is a simple identifier (`col`, `t.col`,
+/// `"quoted col"`). For arbitrary expressions on the left (`(a + b) IS
+/// TRUE`), use the function form `is_true(...)` instead.
+///
+/// Skips matches inside string literals to avoid corrupting query text.
+fn preprocess_is_truth_family(sql: &str) -> String {
+    // Fast path: most SQL strings don't contain `IS TRUE` / `IS FALSE`, and
+    // ASCII byte-walking the rare matches is incompatible with multi-byte
+    // UTF-8 string literals like `'é'`. Skip the rewrite entirely when no
+    // candidate keyword is present.
+    let upper_haystack = sql.to_ascii_uppercase();
+    if !upper_haystack.contains("IS TRUE")
+        && !upper_haystack.contains("IS FALSE")
+        && !upper_haystack.contains("IS NOT TRUE")
+        && !upper_haystack.contains("IS NOT FALSE")
+    {
+        return sql.to_string();
+    }
+
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+
+    while i < n {
+        let ch = bytes[i] as char;
+        // Skip past string literals untouched.
+        if ch == '\'' || ch == '"' {
+            let quote = ch;
+            out.push(ch);
+            i += 1;
+            while i < n {
+                let c = bytes[i] as char;
+                out.push(c);
+                i += 1;
+                if c == quote {
+                    // SQL doubled-quote escape: '' inside ''.
+                    if i < n && (bytes[i] as char) == quote {
+                        out.push(quote);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        // Skip past line comments.
+        if ch == '-' && i + 1 < n && bytes[i + 1] as char == '-' {
+            while i < n && bytes[i] as char != '\n' {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+
+        // Try to match an identifier optionally followed by IS [NOT] TRUE/FALSE.
+        let id_start = i;
+        let id = scan_identifier(bytes, &mut i);
+        if id.is_empty() {
+            out.push(ch);
+            i += 1;
+            continue;
+        }
+        // Look for `IS [NOT] (TRUE|FALSE)` after optional whitespace.
+        let saved_i = i;
+        let mut j = i;
+        skip_ws(bytes, &mut j);
+        if !match_keyword(bytes, &mut j, "IS") {
+            // Not the pattern; emit the identifier as-is.
+            out.push_str(&id);
+            continue;
+        }
+        skip_ws(bytes, &mut j);
+        let negated = match_keyword(bytes, &mut j, "NOT");
+        if negated {
+            skip_ws(bytes, &mut j);
+        }
+        let truthy = if match_keyword(bytes, &mut j, "TRUE") {
+            Some(true)
+        } else if match_keyword(bytes, &mut j, "FALSE") {
+            Some(false)
+        } else {
+            None
+        };
+        match truthy {
+            Some(true_or_false) => {
+                // IS TRUE      → (x IS NOT NULL AND x <> 0)
+                // IS FALSE     → (x IS NOT NULL AND x = 0)
+                // IS NOT TRUE  → (x IS NULL OR x = 0)
+                // IS NOT FALSE → (x IS NULL OR x <> 0)
+                let cmp = if true_or_false ^ negated { "<>" } else { "=" };
+                let null_test = if negated { "IS NULL" } else { "IS NOT NULL" };
+                let combiner = if negated { "OR" } else { "AND" };
+                let expanded = format!("({id} {null_test} {combiner} {id} {cmp} 0)");
+                let _ = id_start;
+                out.push_str(&expanded);
+                i = j;
+            }
+            None => {
+                out.push_str(&id);
+                i = saved_i;
+            }
+        }
+    }
+
+    out
+}
+
+fn scan_identifier(bytes: &[u8], i: &mut usize) -> String {
+    let start = *i;
+    let n = bytes.len();
+    if start >= n {
+        return String::new();
+    }
+    let first = bytes[start] as char;
+    // Quoted identifier: "name" or `name`.
+    if first == '"' || first == '`' {
+        let quote = first;
+        *i += 1;
+        while *i < n {
+            let c = bytes[*i] as char;
+            *i += 1;
+            if c == quote {
+                break;
+            }
+        }
+        // Optional `.qualifier` after a quoted identifier.
+        if *i < n && bytes[*i] as char == '.' {
+            *i += 1;
+            scan_unquoted_id_tail(bytes, i);
+        }
+        return String::from_utf8_lossy(&bytes[start..*i]).into_owned();
+    }
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return String::new();
+    }
+    *i += 1;
+    while *i < n {
+        let c = bytes[*i] as char;
+        if c.is_ascii_alphanumeric() || c == '_' {
+            *i += 1;
+        } else {
+            break;
+        }
+    }
+    // Optional `.qualifier`.
+    if *i < n && bytes[*i] as char == '.' {
+        *i += 1;
+        scan_unquoted_id_tail(bytes, i);
+    }
+    String::from_utf8_lossy(&bytes[start..*i]).into_owned()
+}
+
+fn scan_unquoted_id_tail(bytes: &[u8], i: &mut usize) {
+    let n = bytes.len();
+    while *i < n {
+        let c = bytes[*i] as char;
+        if c.is_ascii_alphanumeric() || c == '_' {
+            *i += 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn skip_ws(bytes: &[u8], i: &mut usize) {
+    let n = bytes.len();
+    while *i < n && (bytes[*i] as char).is_whitespace() {
+        *i += 1;
+    }
+}
+
+fn match_keyword(bytes: &[u8], i: &mut usize, kw: &str) -> bool {
+    let n = bytes.len();
+    let kw_bytes = kw.as_bytes();
+    if *i + kw_bytes.len() > n {
+        return false;
+    }
+    for (k, kb) in kw_bytes.iter().enumerate() {
+        let c = bytes[*i + k];
+        if c.to_ascii_uppercase() != *kb {
+            return false;
+        }
+    }
+    // Make sure the next char isn't an identifier continuation.
+    let after = *i + kw_bytes.len();
+    if after < n {
+        let c = bytes[after] as char;
+        if c.is_ascii_alphanumeric() || c == '_' {
+            return false;
+        }
+    }
+    *i = after;
+    true
 }
 
 fn preprocess_pragma(sql: &str) -> String {

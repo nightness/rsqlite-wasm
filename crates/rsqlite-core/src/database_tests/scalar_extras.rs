@@ -495,6 +495,72 @@ fn partial_index_skipped_when_query_does_not_imply() {
     assert_eq!(r.rows[1].values[0], Value::Integer(2));
 }
 
+// ── IS TRUE / IS FALSE syntax (single-identifier LHS) ────────────────
+
+#[test]
+fn is_true_syntax_with_column_lhs() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 0), (3, NULL)")
+        .unwrap();
+    let r = db.query("SELECT id FROM t WHERE flag IS TRUE ORDER BY id").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(1));
+}
+
+#[test]
+fn is_false_syntax_with_column_lhs() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 0), (3, NULL)")
+        .unwrap();
+    let r = db.query("SELECT id FROM t WHERE flag IS FALSE ORDER BY id").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(2));
+}
+
+#[test]
+fn is_not_true_syntax_includes_null() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 0), (3, NULL)")
+        .unwrap();
+    // IS NOT TRUE matches both falsy and NULL — i.e. ids 2 and 3.
+    let r = db
+        .query("SELECT id FROM t WHERE flag IS NOT TRUE ORDER BY id")
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0].values[0], Value::Integer(2));
+    assert_eq!(r.rows[1].values[0], Value::Integer(3));
+}
+
+#[test]
+fn is_not_false_syntax_includes_null() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, flag INTEGER)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 1), (2, 0), (3, NULL)")
+        .unwrap();
+    let r = db
+        .query("SELECT id FROM t WHERE flag IS NOT FALSE ORDER BY id")
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0].values[0], Value::Integer(1));
+    assert_eq!(r.rows[1].values[0], Value::Integer(3));
+}
+
+#[test]
+fn is_true_syntax_does_not_corrupt_string_literals() {
+    // The literal `'IS TRUE'` should NOT be rewritten — preprocessing
+    // must respect string boundaries.
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+    db.execute("INSERT INTO t VALUES (1, 'IS TRUE'), (2, 'other')")
+        .unwrap();
+    let r = db.query("SELECT id FROM t WHERE label = 'IS TRUE'").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(1));
+}
+
 // ── Bitwise / IS TRUE-FALSE function workarounds ──────────────────────
 
 #[test]
