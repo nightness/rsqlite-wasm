@@ -17,7 +17,7 @@ pub(super) fn execute_create_table(
     catalog: &mut Catalog,
 ) -> Result<ExecResult> {
     if plan.if_not_exists && catalog.get_table(&plan.table_name).is_some() {
-        return Ok(ExecResult { rows_affected: 0 });
+        return Ok(ExecResult::affected(0));
     }
 
     if catalog.get_table(&plan.table_name).is_some() {
@@ -54,7 +54,7 @@ pub(super) fn execute_create_table(
         }
     }
 
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 pub(super) fn execute_create_table_as_select(
@@ -65,7 +65,7 @@ pub(super) fn execute_create_table_as_select(
     catalog: &mut Catalog,
 ) -> Result<ExecResult> {
     if if_not_exists && catalog.get_table(table_name).is_some() {
-        return Ok(ExecResult { rows_affected: 0 });
+        return Ok(ExecResult::affected(0));
     }
 
     if catalog.get_table(table_name).is_some() {
@@ -114,7 +114,7 @@ pub(super) fn execute_create_table_as_select(
         pager.flush()?;
     }
 
-    Ok(ExecResult { rows_affected })
+    Ok(ExecResult::affected(rows_affected))
 }
 
 pub(super) fn execute_create_index(
@@ -123,7 +123,7 @@ pub(super) fn execute_create_index(
     catalog: &mut Catalog,
 ) -> Result<ExecResult> {
     if plan.if_not_exists && catalog.indexes.contains_key(&plan.index_name.to_lowercase()) {
-        return Ok(ExecResult { rows_affected: 0 });
+        return Ok(ExecResult::affected(0));
     }
 
     if catalog.indexes.contains_key(&plan.index_name.to_lowercase()) {
@@ -205,7 +205,7 @@ pub(super) fn execute_create_index(
 
     catalog.reload(pager)?;
 
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 pub(super) fn execute_alter_rename(
@@ -269,7 +269,7 @@ pub(super) fn execute_alter_rename(
     }
 
     catalog.reload(pager)?;
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 fn replace_table_name_in_sql(sql: &str, old_name: &str, new_name: &str) -> String {
@@ -377,7 +377,7 @@ pub(super) fn execute_alter_add_column(
     }
 
     catalog.reload(pager)?;
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 pub(super) fn execute_drop_table(
@@ -388,7 +388,7 @@ pub(super) fn execute_drop_table(
 ) -> Result<ExecResult> {
     if catalog.get_table(table_name).is_none() {
         if if_exists {
-            return Ok(ExecResult { rows_affected: 0 });
+            return Ok(ExecResult::affected(0));
         }
         return Err(Error::Other(format!("no such table: {table_name}")));
     }
@@ -400,7 +400,7 @@ pub(super) fn execute_drop_table(
     }
 
     catalog.reload(pager)?;
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 pub(super) fn execute_drop_index(
@@ -411,7 +411,7 @@ pub(super) fn execute_drop_index(
 ) -> Result<ExecResult> {
     if !catalog.indexes.contains_key(&index_name.to_lowercase()) {
         if if_exists {
-            return Ok(ExecResult { rows_affected: 0 });
+            return Ok(ExecResult::affected(0));
         }
         return Err(Error::Other(format!("no such index: {index_name}")));
     }
@@ -423,7 +423,7 @@ pub(super) fn execute_drop_index(
     }
 
     catalog.reload(pager)?;
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 pub(super) fn execute_create_view(
@@ -435,7 +435,7 @@ pub(super) fn execute_create_view(
 ) -> Result<ExecResult> {
     if catalog.get_view(name).is_some() {
         if if_not_exists {
-            return Ok(ExecResult { rows_affected: 0 });
+            return Ok(ExecResult::affected(0));
         }
         return Err(Error::Other(format!("view {name} already exists")));
     }
@@ -448,7 +448,7 @@ pub(super) fn execute_create_view(
     }
 
     catalog.reload(pager)?;
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 pub(super) fn execute_drop_view(
@@ -459,7 +459,7 @@ pub(super) fn execute_drop_view(
 ) -> Result<ExecResult> {
     if catalog.get_view(name).is_none() {
         if if_exists {
-            return Ok(ExecResult { rows_affected: 0 });
+            return Ok(ExecResult::affected(0));
         }
         return Err(Error::Other(format!("no such view: {name}")));
     }
@@ -471,5 +471,5 @@ pub(super) fn execute_drop_view(
     }
 
     catalog.reload(pager)?;
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }

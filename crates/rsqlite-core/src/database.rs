@@ -78,6 +78,12 @@ impl Database {
             }
             return executor::execute_pragma(name, argument.as_deref(), &mut self.pager, &self.catalog);
         }
+        if plan_has_returning(&plan) {
+            let result = executor::execute_mut(&plan, &mut self.pager, &mut self.catalog)?;
+            return result
+                .returning
+                .ok_or_else(|| crate::error::Error::Other("RETURNING produced no result".into()));
+        }
         executor::execute(&plan, &mut self.pager, &self.catalog)
     }
 
@@ -85,10 +91,10 @@ impl Database {
         let plan = self.get_or_plan(sql)?;
         if let Plan::Pragma { ref name, ref argument } = plan {
             if name == "database_list" {
-                return Ok(ExecResult { rows_affected: 0 });
+                return Ok(ExecResult::affected(0));
             }
             let _ = executor::execute_pragma(name, argument.as_deref(), &mut self.pager, &self.catalog)?;
-            return Ok(ExecResult { rows_affected: 0 });
+            return Ok(ExecResult::affected(0));
         }
         if let Plan::AttachDatabase { ref schema_name, ref file_path } = plan {
             return self.execute_attach(schema_name, file_path);
@@ -150,7 +156,7 @@ impl Database {
     pub fn execute_sql(&mut self, sql: &str) -> Result<SqlResult> {
         let stmts = rsqlite_parser::parse::parse_sql(sql)?;
         if stmts.is_empty() {
-            return Ok(SqlResult::Execute(ExecResult { rows_affected: 0 }));
+            return Ok(SqlResult::Execute(ExecResult::affected(0)));
         }
 
         let stmt = &stmts[0];
@@ -182,6 +188,12 @@ impl Database {
                 &mut self.pager,
                 &self.catalog,
             )?))
+        } else if plan_has_returning(&plan) {
+            let result = executor::execute_mut(&plan, &mut self.pager, &mut self.catalog)?;
+            Ok(SqlResult::Query(result.returning.unwrap_or(QueryResult {
+                columns: vec![],
+                rows: vec![],
+            })))
         } else {
             let is_ddl = matches!(
                 plan,
@@ -252,7 +264,7 @@ impl Database {
         let mut pager = Pager::open(&*self.vfs, file_path)?;
         let catalog = Catalog::load(&mut pager)?;
         self.attached.insert(schema_name.to_string(), AttachedDb { pager, catalog });
-        Ok(ExecResult { rows_affected: 0 })
+        Ok(ExecResult::affected(0))
     }
 
     fn execute_detach(&mut self, schema_name: &str) -> Result<ExecResult> {
@@ -261,13 +273,22 @@ impl Database {
                 "no such database: {schema_name}"
             )));
         }
-        Ok(ExecResult { rows_affected: 0 })
+        Ok(ExecResult::affected(0))
     }
 }
 
 pub enum SqlResult {
     Query(QueryResult),
     Execute(ExecResult),
+}
+
+fn plan_has_returning(plan: &Plan) -> bool {
+    match plan {
+        Plan::Insert(p) => p.returning.is_some(),
+        Plan::Update(p) => p.returning.is_some(),
+        Plan::Delete(p) => p.returning.is_some(),
+        _ => false,
+    }
 }
 
 fn is_query_statement(stmt: &Statement) -> bool {

@@ -19,7 +19,7 @@ pub(super) fn execute_create_trigger(
 ) -> Result<ExecResult> {
     if catalog.triggers.contains_key(&name.to_lowercase()) {
         if if_not_exists {
-            return Ok(ExecResult { rows_affected: 0 });
+            return Ok(ExecResult::affected(0));
         }
         return Err(Error::Other(format!("trigger {name} already exists")));
     }
@@ -50,7 +50,7 @@ pub(super) fn execute_create_trigger(
         pager.commit()?;
     }
     catalog.reload(pager)?;
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 pub(super) fn execute_drop_trigger(
@@ -61,7 +61,7 @@ pub(super) fn execute_drop_trigger(
 ) -> Result<ExecResult> {
     if !catalog.triggers.contains_key(&name.to_lowercase()) {
         if if_exists {
-            return Ok(ExecResult { rows_affected: 0 });
+            return Ok(ExecResult::affected(0));
         }
         return Err(Error::Other(format!("no such trigger: {name}")));
     }
@@ -75,7 +75,7 @@ pub(super) fn execute_drop_trigger(
         pager.commit()?;
     }
     catalog.reload(pager)?;
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }
 
 pub(super) fn fire_triggers(

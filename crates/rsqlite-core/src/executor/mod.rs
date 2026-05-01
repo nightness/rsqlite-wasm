@@ -47,9 +47,18 @@ use update::execute_update;
 use vacuum::execute_vacuum;
 use window::execute_window;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ExecResult {
     pub rows_affected: u64,
+    /// Result rows when the DML carried a RETURNING clause. The dispatcher
+    /// in Database unwraps this into a QueryResult for the caller.
+    pub returning: Option<crate::types::QueryResult>,
+}
+
+impl ExecResult {
+    pub fn affected(rows_affected: u64) -> Self {
+        Self { rows_affected, returning: None }
+    }
 }
 
 pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<QueryResult> {
@@ -352,27 +361,27 @@ pub fn execute_mut(
         }
         Plan::Begin => {
             pager.begin_transaction()?;
-            Ok(ExecResult { rows_affected: 0 })
+            Ok(ExecResult::affected(0))
         }
         Plan::Commit => {
             pager.commit()?;
-            Ok(ExecResult { rows_affected: 0 })
+            Ok(ExecResult::affected(0))
         }
         Plan::Rollback => {
             pager.rollback()?;
-            Ok(ExecResult { rows_affected: 0 })
+            Ok(ExecResult::affected(0))
         }
         Plan::Savepoint(name) => {
             pager.savepoint(name)?;
-            Ok(ExecResult { rows_affected: 0 })
+            Ok(ExecResult::affected(0))
         }
         Plan::Release(name) => {
             pager.release_savepoint(name)?;
-            Ok(ExecResult { rows_affected: 0 })
+            Ok(ExecResult::affected(0))
         }
         Plan::RollbackTo(name) => {
             pager.rollback_to_savepoint(name)?;
-            Ok(ExecResult { rows_affected: 0 })
+            Ok(ExecResult::affected(0))
         }
         _ => Err(Error::Other(
             "use execute for query statements".to_string(),

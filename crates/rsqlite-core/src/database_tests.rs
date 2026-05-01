@@ -6217,6 +6217,124 @@
     }
 
     #[test]
+    fn insert_returning_basic() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)").unwrap();
+        let r = db
+            .query("INSERT INTO t (name) VALUES ('Alice') RETURNING id, name")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(1));
+        assert_eq!(
+            r.rows[0].values[1],
+            crate::types::Value::Text("Alice".to_string())
+        );
+    }
+
+    #[test]
+    fn insert_returning_star() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        let r = db
+            .query("INSERT INTO t VALUES (10, 100) RETURNING *")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(10));
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(100));
+    }
+
+    #[test]
+    fn insert_returning_multiple_rows() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        let r = db
+            .query("INSERT INTO t (n) VALUES (1), (2), (3) RETURNING id")
+            .unwrap();
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[test]
+    fn insert_returning_expression() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        let r = db
+            .query("INSERT INTO t VALUES (1, 5) RETURNING n * 2 AS doubled")
+            .unwrap();
+        assert_eq!(r.columns, vec!["doubled"]);
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(10));
+    }
+
+    #[test]
+    fn update_returning_new_value() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        let r = db
+            .query("UPDATE t SET n = n + 5 WHERE id = 1 RETURNING id, n")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(15));
+    }
+
+    #[test]
+    fn update_returning_multiple_rows() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        let r = db
+            .query("UPDATE t SET n = n * 2 RETURNING id")
+            .unwrap();
+        assert_eq!(r.rows.len(), 3);
+    }
+
+    #[test]
+    fn delete_returning_old_value() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')").unwrap();
+        let r = db
+            .query("DELETE FROM t WHERE id = 1 RETURNING label")
+            .unwrap();
+        assert_eq!(r.rows.len(), 1);
+        assert_eq!(
+            r.rows[0].values[0],
+            crate::types::Value::Text("a".to_string())
+        );
+        // Confirm row is gone
+        let count = db.query("SELECT COUNT(*) FROM t").unwrap();
+        assert_eq!(count.rows[0].values[0], crate::types::Value::Integer(1));
+    }
+
+    #[test]
+    fn delete_returning_star() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+        let r = db.query("DELETE FROM t RETURNING *").unwrap();
+        assert_eq!(r.rows.len(), 2);
+    }
+
+    #[test]
+    fn returning_no_match_yields_empty_result() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        let r = db
+            .query("UPDATE t SET n = 100 WHERE id = 999 RETURNING id")
+            .unwrap();
+        assert_eq!(r.rows.len(), 0);
+    }
+
+    #[test]
     fn default_persists_across_reopen() {
         let db_path = "/tmp/rsqlite_db_default_persist.db";
         let _ = std::fs::remove_file(db_path);

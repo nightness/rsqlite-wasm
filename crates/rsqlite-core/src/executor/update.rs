@@ -16,7 +16,7 @@ use super::constraints::{
     check_unique_constraints,
 };
 use super::eval::eval_expr;
-use super::helpers::{build_index_key, get_table_indexes, row_values_for_rowid};
+use super::helpers::{build_index_key, build_returning_result, get_table_indexes, row_values_for_rowid};
 use super::state::set_changes;
 use super::trigger::fire_triggers;
 use super::ExecResult;
@@ -80,6 +80,7 @@ pub(super) fn execute_update(plan: &UpdatePlan, pager: &mut Pager, catalog: &Cat
 
     let rows_affected = to_update.len() as u64;
     let table_indexes = get_table_indexes(catalog, &plan.table_name);
+    let mut returning_values: Vec<Vec<Value>> = Vec::new();
 
     let mut current_root = plan.root_page;
     for (rowid, new_values) in to_update {
@@ -132,6 +133,18 @@ pub(super) fn execute_update(plan: &UpdatePlan, pager: &mut Pager, catalog: &Cat
             pager,
             catalog,
         )?;
+
+        if plan.returning.is_some() {
+            // For RETURNING, expose the post-update row values; rowid alias
+            // columns get the rowid filled in.
+            let mut row_for_returning = new_values.clone();
+            for (i, c) in plan.table_columns.iter().enumerate() {
+                if c.is_rowid_alias {
+                    row_for_returning[i] = Value::Integer(rowid);
+                }
+            }
+            returning_values.push(row_for_returning);
+        }
     }
 
     if !pager.in_transaction() {
@@ -139,5 +152,10 @@ pub(super) fn execute_update(plan: &UpdatePlan, pager: &mut Pager, catalog: &Cat
     }
 
     set_changes(rows_affected as i64);
-    Ok(ExecResult { rows_affected })
+    let returning = if let Some(items) = &plan.returning {
+        Some(build_returning_result(items, &returning_values, &plan.table_columns, pager, catalog)?)
+    } else {
+        None
+    };
+    Ok(ExecResult { rows_affected, returning })
 }

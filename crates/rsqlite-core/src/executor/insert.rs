@@ -17,8 +17,8 @@ use super::constraints::{
 };
 use super::eval::eval_expr;
 use super::helpers::{
-    apply_column_defaults, build_index_key, eval_insert_row, get_table_indexes,
-    map_query_row_to_insert, read_row_by_rowid,
+    apply_column_defaults, build_index_key, build_returning_result, eval_insert_row,
+    get_table_indexes, map_query_row_to_insert, read_row_by_rowid,
 };
 use super::state::{set_changes, set_last_insert_rowid};
 use super::trigger::fire_triggers;
@@ -32,6 +32,7 @@ pub(super) fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Cat
         .get_table(&plan.table_name)
         .is_some_and(|t| t.has_autoincrement);
     let mut max_rowid_inserted = 0i64;
+    let mut returning_values: Vec<Vec<Value>> = Vec::new();
 
     if let Some(source) = &plan.source_query {
         let query_result = super::execute(source, pager, catalog)?;
@@ -78,6 +79,9 @@ pub(super) fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Cat
                 btree_index_insert(pager, *idx_root, &key)
                     .map_err(|e| Error::Other(e.to_string()))?;
             }
+            if plan.returning.is_some() {
+                returning_values.push(row_with_rowid(&values, rowid, &plan.table_columns));
+            }
             rows_affected += 1;
         }
 
@@ -89,7 +93,12 @@ pub(super) fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Cat
             pager.flush()?;
         }
         set_changes(rows_affected as i64);
-        return Ok(ExecResult { rows_affected });
+        let returning = if let Some(items) = &plan.returning {
+            Some(build_returning_result(items, &returning_values, &plan.table_columns, pager, catalog)?)
+        } else {
+            None
+        };
+        return Ok(ExecResult { rows_affected, returning });
     }
 
     let mut last_rowid = 0i64;
@@ -331,6 +340,9 @@ pub(super) fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Cat
             catalog,
         )?;
 
+        if plan.returning.is_some() {
+            returning_values.push(row_with_rowid(&values, rowid, &plan.table_columns));
+        }
         rows_affected += 1;
     }
 
@@ -344,5 +356,30 @@ pub(super) fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Cat
 
     set_last_insert_rowid(last_rowid);
     set_changes(rows_affected as i64);
-    Ok(ExecResult { rows_affected })
+    let returning = if let Some(items) = &plan.returning {
+        Some(build_returning_result(items, &returning_values, &plan.table_columns, pager, catalog)?)
+    } else {
+        None
+    };
+    Ok(ExecResult { rows_affected, returning })
+}
+
+/// Build a row whose rowid-alias columns carry the actual rowid (rather than
+/// NULL when omitted from the INSERT).
+fn row_with_rowid(
+    values: &[Value],
+    rowid: i64,
+    table_columns: &[crate::planner::ColumnRef],
+) -> Vec<Value> {
+    table_columns
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            if c.is_rowid_alias && matches!(values.get(i), Some(Value::Null) | None) {
+                Value::Integer(rowid)
+            } else {
+                values.get(i).cloned().unwrap_or(Value::Null)
+            }
+        })
+        .collect()
 }

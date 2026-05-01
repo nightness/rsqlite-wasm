@@ -5,7 +5,8 @@ use rsqlite_storage::pager::Pager;
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 use crate::eval_helpers::literal_to_value;
-use crate::planner::{ColumnRef, PlanExpr, UnaryOp};
+use crate::planner::{ColumnRef, PlanExpr, ProjectionItem, UnaryOp};
+use crate::types::QueryResult;
 
 pub(super) fn values_equal(a: &Value, b: &Value) -> bool {
     match (a, b) {
@@ -208,6 +209,31 @@ pub(super) fn eval_insert_row(
             Ok((values, explicitly_set))
         }
     }
+}
+
+/// Evaluate a list of RETURNING projections against each row in `affected`
+/// and produce a QueryResult. Each row in `affected` must align column-wise
+/// with `table_columns` (rowid alias columns should already carry the rowid).
+pub(super) fn build_returning_result(
+    returning: &[ProjectionItem],
+    affected: &[Vec<crate::types::Value>],
+    table_columns: &[ColumnRef],
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<QueryResult> {
+    let columns: Vec<String> = returning.iter().map(|p| p.alias.clone()).collect();
+    let col_names: Vec<String> = table_columns.iter().map(|c| c.name.clone()).collect();
+    let mut rows = Vec::with_capacity(affected.len());
+    for values in affected {
+        let row = crate::types::Row { values: values.clone() };
+        let mut out_values = Vec::with_capacity(returning.len());
+        for proj in returning {
+            let v = super::eval::eval_expr(&proj.expr, &row, &col_names, pager, catalog)?;
+            out_values.push(v);
+        }
+        rows.push(crate::types::Row { values: out_values });
+    }
+    Ok(QueryResult { columns, rows })
 }
 
 pub(super) fn apply_column_defaults(

@@ -21,7 +21,7 @@ pub(super) fn execute_vacuum(pager: &mut Pager, catalog: &mut Catalog) -> Result
 
     let schema_entries = read_schema(pager)?;
     if schema_entries.is_empty() {
-        return Ok(ExecResult { rows_affected: 0 });
+        return Ok(ExecResult::affected(0));
     }
 
     let temp_vfs = rsqlite_vfs::memory::MemoryVfs::new();
@@ -94,5 +94,5 @@ pub(super) fn execute_vacuum(pager: &mut Pager, catalog: &mut Catalog) -> Result
     pager.replace_content(&buf)?;
     catalog.reload(pager)?;
 
-    Ok(ExecResult { rows_affected: 0 })
+    Ok(ExecResult::affected(0))
 }

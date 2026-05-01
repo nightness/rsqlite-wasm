@@ -10,7 +10,7 @@ use crate::types::Row;
 
 use super::constraints::check_foreign_key_delete;
 use super::eval::eval_expr;
-use super::helpers::{build_index_key, get_table_indexes, row_values_for_rowid};
+use super::helpers::{build_index_key, build_returning_result, get_table_indexes, row_values_for_rowid};
 use super::state::set_changes;
 use super::trigger::fire_triggers;
 use super::ExecResult;
@@ -69,6 +69,7 @@ pub(super) fn execute_delete(plan: &DeletePlan, pager: &mut Pager, catalog: &Cat
         }
     }
 
+    let mut returning_values: Vec<Vec<Value>> = Vec::new();
     for rowid in to_delete {
         let old_values = row_values_for_rowid(&btree_rows, rowid, &plan.table_columns);
         let old_named: Vec<(String, Value)> = plan.table_columns.iter()
@@ -85,6 +86,10 @@ pub(super) fn execute_delete(plan: &DeletePlan, pager: &mut Pager, catalog: &Cat
             pager,
             catalog,
         )?;
+
+        if plan.returning.is_some() {
+            returning_values.push(old_values.clone());
+        }
 
         for (idx_root, idx_col_indices) in &table_indexes {
             let old_key =
@@ -109,5 +114,10 @@ pub(super) fn execute_delete(plan: &DeletePlan, pager: &mut Pager, catalog: &Cat
     }
 
     set_changes(rows_affected as i64);
-    Ok(ExecResult { rows_affected })
+    let returning = if let Some(items) = &plan.returning {
+        Some(build_returning_result(items, &returning_values, &plan.table_columns, pager, catalog)?)
+    } else {
+        None
+    };
+    Ok(ExecResult { rows_affected, returning })
 }

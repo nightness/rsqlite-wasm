@@ -56,6 +56,7 @@ pub struct InsertPlan {
     pub source_query: Option<Box<Plan>>,
     pub on_conflict: Option<OnConflictPlan>,
     pub or_replace: bool,
+    pub returning: Option<Vec<ProjectionItem>>,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +79,7 @@ pub struct UpdatePlan {
     pub table_columns: Vec<ColumnRef>,
     pub assignments: Vec<(String, PlanExpr)>,
     pub predicate: Option<PlanExpr>,
+    pub returning: Option<Vec<ProjectionItem>>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +88,7 @@ pub struct DeletePlan {
     pub root_page: u32,
     pub table_columns: Vec<ColumnRef>,
     pub predicate: Option<PlanExpr>,
+    pub returning: Option<Vec<ProjectionItem>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -268,8 +271,9 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
             table,
             assignments,
             selection,
+            returning,
             ..
-        } => plan_update(table, assignments, selection.as_ref(), catalog),
+        } => plan_update(table, assignments, selection.as_ref(), returning.as_deref(), catalog),
         Statement::Delete(delete) => plan_delete(delete, catalog),
         Statement::Drop {
             object_type,
@@ -1785,6 +1789,12 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
         }
     };
 
+    let returning = insert
+        .returning
+        .as_ref()
+        .map(|items| plan_select_items(items, &all_columns, catalog))
+        .transpose()?;
+
     Ok(Plan::Insert(InsertPlan {
         table_name,
         root_page: table_def.root_page,
@@ -1794,6 +1804,7 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
         source_query,
         on_conflict,
         or_replace,
+        returning,
     }))
 }
 
@@ -1801,6 +1812,7 @@ fn plan_update(
     table: &ast::TableWithJoins,
     assignments: &[ast::Assignment],
     selection: Option<&Expr>,
+    returning: Option<&[ast::SelectItem]>,
     catalog: &Catalog,
 ) -> Result<Plan> {
     let table_name = match &table.relation {
@@ -1848,12 +1860,17 @@ fn plan_update(
         .map(|s| plan_expr(s, &all_columns, catalog))
         .transpose()?;
 
+    let returning_planned = returning
+        .map(|items| plan_select_items(items, &all_columns, catalog))
+        .transpose()?;
+
     Ok(Plan::Update(UpdatePlan {
         table_name,
         root_page: table_def.root_page,
         table_columns: all_columns,
         assignments: planned_assignments,
         predicate,
+        returning: returning_planned,
     }))
 }
 
@@ -1901,10 +1918,17 @@ fn plan_delete(delete: &ast::Delete, catalog: &Catalog) -> Result<Plan> {
         .map(|s| plan_expr(s, &all_columns, catalog))
         .transpose()?;
 
+    let returning = delete
+        .returning
+        .as_ref()
+        .map(|items| plan_select_items(items, &all_columns, catalog))
+        .transpose()?;
+
     Ok(Plan::Delete(DeletePlan {
         table_name,
         root_page: table_def.root_page,
         table_columns: all_columns,
         predicate,
+        returning,
     }))
 }
