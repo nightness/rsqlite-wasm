@@ -8,11 +8,10 @@ explains the gap, the workaround if any, and where to follow progress.
 
 Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 
-- **Bitwise complement `~`.** Supported as syntax for simple operands
-  via a parser pre-pass: `~col` and `~(expr)` rewrite to
-  `__bnot(col)` / `__bnot((expr))` before sqlparser sees them. For
-  numeric literals or complex prefixes that the rewriter doesn't
-  match, use `__bnot(...)` directly.
+- **Bitwise complement `~`.** Supported as syntax via a parser
+  pre-pass: identifiers (qualified or not), parenthesized expressions,
+  and numeric literals all rewrite to `__bnot(...)` before sqlparser
+  sees them.
 
 - **Bitwise shift `<<` and `>>`.** Supported as syntax for "safe"
   operands via a parser pre-pass: identifier (possibly qualified),

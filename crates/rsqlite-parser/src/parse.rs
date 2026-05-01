@@ -890,6 +890,21 @@ fn preprocess_bitwise_not(sql: &str) -> String {
             out.push_str(&format!("__bnot({operand})"));
             continue;
         }
+        // Numeric literal — integer or decimal (no exponent / hex for now,
+        // matching what SQLite would accept after `~`).
+        if next_ch.is_ascii_digit() {
+            let start = i;
+            while i < n {
+                let c = bytes[i] as char;
+                if c.is_ascii_digit() || c == '.' {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            out.push_str(&format!("__bnot({})", &sql[start..i]));
+            continue;
+        }
         // Identifier (possibly qualified).
         let id = scan_identifier(bytes, &mut i);
         if id.is_empty() {

@@ -654,6 +654,16 @@ fn tilde_prefix_complements_parenthesized_expr() {
 }
 
 #[test]
+fn tilde_prefix_complements_numeric_literal() {
+    let mut db = fresh();
+    // Bare-literal form: `~5` should rewrite to `__bnot(5)` and yield -6.
+    let r = db.query("SELECT ~5 AS v").unwrap();
+    assert_eq!(r.rows[0].values[0], Value::Integer(-6));
+    let r = db.query("SELECT ~0 AS v").unwrap();
+    assert_eq!(r.rows[0].values[0], Value::Integer(-1));
+}
+
+#[test]
 fn tilde_prefix_in_where() {
     let mut db = fresh();
     db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
