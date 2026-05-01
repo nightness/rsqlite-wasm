@@ -72,6 +72,14 @@ pub struct TableDef {
     pub check_constraints: Vec<String>,
     pub has_autoincrement: bool,
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// Lowercased column names that participate in a composite (multi-
+    /// column) PRIMARY KEY. Empty for tables with a single-column PK or
+    /// no PK at all — those cases are still discoverable via per-column
+    /// `ColumnDef::is_primary_key`. Composite-PK uniqueness is enforced
+    /// as a tuple in `check_unique_constraints`; member columns are NOT
+    /// individually marked `is_unique` because the constraint applies to
+    /// the combination, not each axis.
+    pub pk_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -256,6 +264,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 check_constraints: vec![],
                 has_autoincrement: false,
                 foreign_keys: vec![],
+                pk_columns: vec![],
             }));
         }
     };
@@ -311,6 +320,12 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 .any(|opt| matches!(opt.option, ColumnOption::NotNull))
                 && !is_primary_key;
 
+            // A column is individually unique when it carries an explicit
+            // UNIQUE option, OR when it's the sole member of the table's
+            // PK. Composite-PK members are NOT individually unique — the
+            // uniqueness applies to the column tuple, enforced at insert
+            // time using `TableDef::pk_columns`.
+            let is_pk_composite = is_pk_from_table && table_pk_cols.len() > 1;
             let is_unique = col.options.iter().any(|opt| {
                 matches!(
                     opt.option,
@@ -319,7 +334,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                         ..
                     }
                 )
-            }) || is_primary_key;
+            }) || (is_primary_key && !is_pk_composite);
 
             let autoincrement = col.options.iter().any(|opt| {
                 if let ColumnOption::DialectSpecific(tokens) = &opt.option {
@@ -432,6 +447,14 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
             }
         }
 
+        // Only persist `pk_columns` when the PK is composite — single-
+        // column PKs are already captured by `ColumnDef::is_primary_key`.
+        let pk_columns = if table_pk_cols.len() > 1 {
+            table_pk_cols
+        } else {
+            Vec::new()
+        };
+
         Ok(Some(TableDef {
             name: entry.name.clone(),
             columns,
@@ -440,6 +463,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
             check_constraints,
             has_autoincrement,
             foreign_keys,
+            pk_columns,
         }))
     } else {
         Ok(None)

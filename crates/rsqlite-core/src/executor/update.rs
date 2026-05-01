@@ -170,6 +170,7 @@ pub(super) fn execute_update(
                     pager,
                     plan.root_page,
                     Some(btree_row.rowid),
+                    catalog,
                 )?;
                 check_check_constraints(
                     &new_values,
@@ -224,6 +225,7 @@ pub(super) fn execute_update(
                 pager,
                 plan.root_page,
                 Some(btree_row.rowid),
+                catalog,
             )?;
             check_check_constraints(
                 &new_values,

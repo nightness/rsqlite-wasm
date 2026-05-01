@@ -117,6 +117,7 @@ fn execute_insert_inner(
                 pager,
                 current_root,
                 None,
+                catalog,
             )?;
             check_check_constraints(
                 &values,
@@ -409,6 +410,7 @@ fn execute_insert_inner(
             pager,
             current_root,
             None,
+            catalog,
         )?;
         check_check_constraints(
             &values,

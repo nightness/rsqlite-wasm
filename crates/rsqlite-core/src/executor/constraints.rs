@@ -95,6 +95,7 @@ pub(super) fn check_unique_constraints(
     pager: &mut Pager,
     root_page: u32,
     exclude_rowid: Option<i64>,
+    catalog: &Catalog,
 ) -> Result<()> {
     let unique_cols: Vec<(usize, &str)> = columns
         .iter()
@@ -103,7 +104,24 @@ pub(super) fn check_unique_constraints(
         .map(|(i, c)| (i, c.name.as_str()))
         .collect();
 
-    if unique_cols.is_empty() {
+    // Composite PK indices (lowercased name → column position in `columns`).
+    // Empty if the table has a single-column PK or no PK at all — those
+    // cases are covered by the per-column `is_unique` check above.
+    let composite_pk: Vec<(usize, &str)> = match catalog.get_table(table_name) {
+        Some(td) if td.pk_columns.len() > 1 => td
+            .pk_columns
+            .iter()
+            .filter_map(|name| {
+                columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(name))
+                    .map(|i| (i, columns[i].name.as_str()))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+
+    if unique_cols.is_empty() && composite_pk.is_empty() {
         return Ok(());
     }
 
@@ -133,6 +151,44 @@ pub(super) fn check_unique_constraints(
             }
         }
     }
+
+    // Composite-PK tuple check: a row conflicts only when *every* PK
+    // column matches simultaneously. Per SQLite semantics any NULL in
+    // the new tuple disables the conflict (NULLs are distinct under
+    // UNIQUE), matching the behavior of an SQLite composite UNIQUE
+    // index over the same columns.
+    if !composite_pk.is_empty() {
+        let any_null = composite_pk
+            .iter()
+            .any(|(idx, _)| matches!(values[*idx], Value::Null));
+        if !any_null {
+            for row in &rows {
+                if let Some(exclude) = exclude_rowid {
+                    if row.rowid == exclude {
+                        continue;
+                    }
+                }
+                let all_match = composite_pk.iter().all(|(idx, _)| {
+                    row.record
+                        .values
+                        .get(*idx)
+                        .map(|existing| compare(existing, &values[*idx]) == 0)
+                        .unwrap_or(false)
+                });
+                if all_match {
+                    let names = composite_pk
+                        .iter()
+                        .map(|(_, name)| format!("{table_name}.{name}"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(Error::Other(format!(
+                        "UNIQUE constraint failed: {names}"
+                    )));
+                }
+            }
+        }
+    }
+
     Ok(())
 }
 

@@ -1602,3 +1602,83 @@ fn attach_duplicate_error() {
     db.execute("ATTACH DATABASE 'other.db' AS aux").unwrap();
     assert!(db.execute("ATTACH DATABASE 'other.db' AS aux").is_err());
 }
+
+// ── Composite PRIMARY KEY uniqueness ─────────────────────────────────
+//
+// Regression: composite-PK member columns used to be marked individually
+// `is_unique`, so an INSERT that reused only one of the PK column values
+// would falsely trip "UNIQUE constraint failed: t.<col>" even though the
+// (col_a, col_b) tuple was still distinct. The chat-pwa caught this with
+// `messages(conversation_id, message_id)` — second message in a
+// conversation rejected because conversation_id repeated. The fix tracks
+// `pk_columns` on TableDef and only enforces uniqueness on the tuple.
+
+#[test]
+fn composite_pk_distinct_combinations_succeed() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute(
+        "CREATE TABLE messages (
+             conversation_id TEXT NOT NULL,
+             message_id TEXT NOT NULL,
+             role TEXT,
+             PRIMARY KEY (conversation_id, message_id)
+         )",
+    )
+    .unwrap();
+    // Same conversation_id, different message_ids — both should insert.
+    db.execute("INSERT INTO messages VALUES ('c1', 'm1', 'user')")
+        .unwrap();
+    db.execute("INSERT INTO messages VALUES ('c1', 'm2', 'assistant')")
+        .unwrap();
+    db.execute("INSERT INTO messages VALUES ('c1', 'm3', 'user')")
+        .unwrap();
+    // Same message_id but different conversation_id — also distinct.
+    db.execute("INSERT INTO messages VALUES ('c2', 'm1', 'user')")
+        .unwrap();
+    let r = db.query("SELECT COUNT(*) FROM messages").unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(4));
+}
+
+#[test]
+fn composite_pk_full_tuple_match_rejected() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute(
+        "CREATE TABLE messages (
+             conversation_id TEXT NOT NULL,
+             message_id TEXT NOT NULL,
+             role TEXT,
+             PRIMARY KEY (conversation_id, message_id)
+         )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO messages VALUES ('c1', 'm1', 'user')")
+        .unwrap();
+    let r = db.execute("INSERT INTO messages VALUES ('c1', 'm1', 'user')");
+    assert!(r.is_err());
+    let msg = r.unwrap_err().to_string();
+    assert!(
+        msg.contains("UNIQUE constraint failed"),
+        "expected UNIQUE error, got: {msg}"
+    );
+    // The error should name BOTH PK columns since the tuple is what's
+    // unique — not just the first column.
+    assert!(
+        msg.contains("conversation_id") && msg.contains("message_id"),
+        "expected both PK columns in error, got: {msg}"
+    );
+}
+
+#[test]
+fn single_column_pk_still_enforced() {
+    // Sanity: the fix must not regress single-column PK uniqueness.
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute("CREATE TABLE t (id TEXT PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES ('a', 'x')").unwrap();
+    let r = db.execute("INSERT INTO t VALUES ('a', 'y')");
+    assert!(r.is_err());
+    assert!(r.unwrap_err().to_string().contains("UNIQUE constraint failed"));
+}
