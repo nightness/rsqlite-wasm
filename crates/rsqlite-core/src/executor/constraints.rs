@@ -118,6 +118,50 @@ pub(super) fn check_unique_constraints(
     Ok(())
 }
 
+/// Find a row whose values for the given column names equal the values being
+/// inserted. Returns the rowid of the conflicting row, or None.
+pub(super) fn find_conflict_by_columns(
+    values: &[Value],
+    conflict_columns: &[String],
+    columns: &[ColumnRef],
+    pager: &mut Pager,
+    root_page: u32,
+) -> Result<Option<i64>> {
+    let col_indices: Vec<usize> = conflict_columns
+        .iter()
+        .map(|name| {
+            columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| Error::Other(format!("unknown conflict column: {name}")))
+        })
+        .collect::<Result<_>>()?;
+
+    let mut cursor = BTreeCursor::new(pager, root_page);
+    let rows = cursor.collect_all().map_err(|e| Error::Other(e.to_string()))?;
+
+    for row in &rows {
+        let all_match = col_indices.iter().all(|&ci| {
+            let new_val = &values[ci];
+            let existing = if columns[ci].is_rowid_alias {
+                Value::Integer(row.rowid)
+            } else {
+                row.record.values.get(ci).cloned().unwrap_or(Value::Null)
+            };
+            // NULL never matches NULL for conflict purposes.
+            if matches!(new_val, Value::Null) || matches!(existing, Value::Null) {
+                false
+            } else {
+                compare(&existing, new_val) == 0
+            }
+        });
+        if all_match {
+            return Ok(Some(row.rowid));
+        }
+    }
+    Ok(None)
+}
+
 pub(super) fn find_unique_conflict_rowid(
     values: &[Value],
     columns: &[ColumnRef],

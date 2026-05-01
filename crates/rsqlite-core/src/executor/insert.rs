@@ -13,7 +13,7 @@ use crate::types::Row;
 use super::autoincrement::{compute_autoincrement_rowid, update_autoincrement_seq};
 use super::constraints::{
     check_check_constraints, check_foreign_key_insert, check_not_null_constraints,
-    check_unique_constraints, find_unique_conflict_rowid,
+    check_unique_constraints, find_conflict_by_columns, find_unique_conflict_rowid,
 };
 use super::eval::eval_expr;
 use super::helpers::{
@@ -157,20 +157,94 @@ pub(super) fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Cat
                     .map_err(|e| Error::Other(e.to_string()))?;
             }
         } else if let Some(on_conflict) = &plan.on_conflict {
-            if btree_row_exists(pager, current_root, rowid)? {
+            // Detect conflict: by named conflict_columns if given, otherwise
+            // by rowid (legacy/default behavior).
+            let conflict_rowid = match on_conflict {
+                OnConflictPlan::DoNothing => {
+                    if btree_row_exists(pager, current_root, rowid)? {
+                        Some(rowid)
+                    } else {
+                        find_unique_conflict_rowid(
+                            &values,
+                            &plan.table_columns,
+                            pager,
+                            current_root,
+                        )?
+                    }
+                }
+                OnConflictPlan::DoUpdate { conflict_columns, .. } => {
+                    if conflict_columns.is_empty() {
+                        if btree_row_exists(pager, current_root, rowid)? {
+                            Some(rowid)
+                        } else {
+                            find_unique_conflict_rowid(
+                                &values,
+                                &plan.table_columns,
+                                pager,
+                                current_root,
+                            )?
+                        }
+                    } else {
+                        find_conflict_by_columns(
+                            &values,
+                            conflict_columns,
+                            &plan.table_columns,
+                            pager,
+                            current_root,
+                        )?
+                    }
+                }
+            };
+
+            if let Some(existing_rowid) = conflict_rowid {
                 match on_conflict {
                     OnConflictPlan::DoNothing => continue,
-                    OnConflictPlan::DoUpdate { assignments } => {
-                        let old_values =
-                            read_row_by_rowid(pager, current_root, rowid, &plan.table_columns)?;
-                        let col_names: Vec<String> =
-                            plan.table_columns.iter().map(|c| c.name.clone()).collect();
-                        let old_row = Row {
-                            values: old_values.clone(),
-                        };
+                    OnConflictPlan::DoUpdate { assignments, where_clause, .. } => {
+                        let old_values = read_row_by_rowid(
+                            pager,
+                            current_root,
+                            existing_rowid,
+                            &plan.table_columns,
+                        )?;
+                        // Build a combined row: [old_values..., new_values...]
+                        // so `excluded.col` references (planned at indices
+                        // table_columns.len() + col.column_index) resolve to
+                        // the just-attempted INSERT values.
+                        let mut combined_values = old_values.clone();
+                        combined_values.extend_from_slice(&values);
+                        let combined_row = Row { values: combined_values };
+                        let mut combined_col_names: Vec<String> = plan
+                            .table_columns
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .collect();
+                        for c in &plan.table_columns {
+                            combined_col_names.push(format!("excluded.{}", c.name));
+                        }
+
+                        // WHERE clause on DO UPDATE: skip if false.
+                        if let Some(pred) = where_clause {
+                            let v = eval_expr(
+                                pred,
+                                &combined_row,
+                                &combined_col_names,
+                                pager,
+                                catalog,
+                            )?;
+                            if !crate::eval_helpers::is_truthy(&v) {
+                                continue;
+                            }
+                        }
+
                         let mut updated = old_values.clone();
                         for (col_name, expr) in assignments {
-                            let val = eval_expr(expr, &old_row, &col_names, pager, catalog)?;
+                            let val = eval_expr(
+                                expr,
+                                &combined_row,
+                                &combined_col_names,
+                                pager,
+                                catalog,
+                            )?;
                             let idx = plan
                                 .table_columns
                                 .iter()
@@ -185,23 +259,23 @@ pub(super) fn execute_insert(plan: &InsertPlan, pager: &mut Pager, catalog: &Cat
                                 &old_values,
                                 idx_col_indices,
                                 &plan.table_columns,
-                                rowid,
+                                existing_rowid,
                             );
                             btree_index_delete(pager, *idx_root, &old_key)
                                 .map_err(|e| Error::Other(e.to_string()))?;
                         }
-                        btree_delete(pager, current_root, rowid)
+                        btree_delete(pager, current_root, existing_rowid)
                             .map_err(|e| Error::Other(e.to_string()))?;
                         let record = Record {
                             values: updated.clone(),
                         };
-                        current_root = btree_insert(pager, current_root, rowid, &record)?;
+                        current_root = btree_insert(pager, current_root, existing_rowid, &record)?;
                         for (idx_root, idx_col_indices) in &table_indexes {
                             let new_key = build_index_key(
                                 &updated,
                                 idx_col_indices,
                                 &plan.table_columns,
-                                rowid,
+                                existing_rowid,
                             );
                             btree_index_insert(pager, *idx_root, &new_key)
                                 .map_err(|e| Error::Other(e.to_string()))?;

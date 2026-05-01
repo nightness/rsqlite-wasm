@@ -6112,6 +6112,111 @@
     }
 
     #[test]
+    fn upsert_conflict_target_unique_column() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)",
+        )
+        .unwrap();
+        db.execute("INSERT INTO users VALUES (1, 'a@x.com', 'Alice')").unwrap();
+        // Conflict on email — should update Alice -> Alicia
+        db.execute(
+            "INSERT INTO users (email, name) VALUES ('a@x.com', 'Alicia') ON CONFLICT (email) DO UPDATE SET name = 'Alicia'",
+        )
+        .unwrap();
+
+        let r = db.query("SELECT name FROM users WHERE id = 1").unwrap();
+        assert_eq!(
+            r.rows[0].values[0],
+            crate::types::Value::Text("Alicia".to_string())
+        );
+    }
+
+    #[test]
+    fn upsert_with_excluded_reference() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE counts (k TEXT PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO counts VALUES ('hits', 5)").unwrap();
+        // Increment-on-conflict using excluded.n + old n
+        db.execute(
+            "INSERT INTO counts (k, n) VALUES ('hits', 3) ON CONFLICT (k) DO UPDATE SET n = n + excluded.n",
+        )
+        .unwrap();
+
+        let r = db.query("SELECT n FROM counts WHERE k = 'hits'").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(8));
+    }
+
+    #[test]
+    fn upsert_excluded_replaces_value() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'old')").unwrap();
+        db.execute(
+            "INSERT INTO t VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET label = excluded.label",
+        )
+        .unwrap();
+
+        let r = db.query("SELECT label FROM t WHERE id = 1").unwrap();
+        assert_eq!(
+            r.rows[0].values[0],
+            crate::types::Value::Text("new".to_string())
+        );
+    }
+
+    #[test]
+    fn upsert_inserts_when_no_conflict() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+        // No conflict (id=2 doesn't exist) -> normal insert
+        db.execute(
+            "INSERT INTO t VALUES (2, 20) ON CONFLICT (id) DO UPDATE SET n = excluded.n",
+        )
+        .unwrap();
+
+        let r = db.query("SELECT id, n FROM t ORDER BY id").unwrap();
+        assert_eq!(r.rows.len(), 2);
+        assert_eq!(r.rows[1].values[1], crate::types::Value::Integer(20));
+    }
+
+    #[test]
+    fn upsert_with_where_clause_skips_when_false() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+        // WHERE n < excluded.n: 100 < 5 is FALSE, so no update
+        db.execute(
+            "INSERT INTO t VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE n < excluded.n",
+        )
+        .unwrap();
+
+        let r = db.query("SELECT n FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(100));
+    }
+
+    #[test]
+    fn upsert_with_where_clause_applies_when_true() {
+        let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+        let mut db = Database::create(&vfs, "test.db").unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 5)").unwrap();
+        // WHERE n < excluded.n: 5 < 100 is TRUE, so update happens
+        db.execute(
+            "INSERT INTO t VALUES (1, 100) ON CONFLICT (id) DO UPDATE SET n = excluded.n WHERE n < excluded.n",
+        )
+        .unwrap();
+
+        let r = db.query("SELECT n FROM t WHERE id = 1").unwrap();
+        assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(100));
+    }
+
+    #[test]
     fn default_persists_across_reopen() {
         let db_path = "/tmp/rsqlite_db_default_persist.db";
         let _ = std::fs::remove_file(db_path);

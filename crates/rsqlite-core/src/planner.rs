@@ -62,7 +62,12 @@ pub struct InsertPlan {
 pub enum OnConflictPlan {
     DoNothing,
     DoUpdate {
+        /// Column names that identify the conflict target. Empty means "any
+        /// uniqueness violation" (matches SQLite without an explicit target).
+        conflict_columns: Vec<String>,
         assignments: Vec<(String, PlanExpr)>,
+        /// WHERE clause on the DO UPDATE branch.
+        where_clause: Option<PlanExpr>,
     },
 }
 
@@ -1728,6 +1733,29 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
             Some(ast::OnInsert::OnConflict(oc)) => match &oc.action {
                 ast::OnConflictAction::DoNothing => Some(OnConflictPlan::DoNothing),
                 ast::OnConflictAction::DoUpdate(do_update) => {
+                    let conflict_columns = match &oc.conflict_target {
+                        Some(ast::ConflictTarget::Columns(cols)) => {
+                            cols.iter().map(|c| c.value.clone()).collect()
+                        }
+                        _ => Vec::new(),
+                    };
+                    // Planning context: include `excluded.<col>` references
+                    // alongside the table's regular columns.
+                    let mut excluded_columns: Vec<ColumnRef> = all_columns
+                        .iter()
+                        .map(|c| ColumnRef {
+                            name: c.name.clone(),
+                            column_index: all_columns.len() + c.column_index,
+                            is_rowid_alias: false,
+                            table: Some("excluded".to_string()),
+                            nullable: c.nullable,
+                            is_primary_key: c.is_primary_key,
+                            is_unique: c.is_unique,
+                        })
+                        .collect();
+                    let mut planning_columns = all_columns.clone();
+                    planning_columns.append(&mut excluded_columns);
+
                     let mut assignments = Vec::new();
                     for assign in &do_update.assignments {
                         let col_name = match &assign.target {
@@ -1738,10 +1766,19 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
                                 ))
                             }
                         };
-                        let expr = plan_expr(&assign.value, &all_columns, catalog)?;
+                        let expr = plan_expr(&assign.value, &planning_columns, catalog)?;
                         assignments.push((col_name, expr));
                     }
-                    Some(OnConflictPlan::DoUpdate { assignments })
+                    let where_clause = do_update
+                        .selection
+                        .as_ref()
+                        .map(|e| plan_expr(e, &planning_columns, catalog))
+                        .transpose()?;
+                    Some(OnConflictPlan::DoUpdate {
+                        conflict_columns,
+                        assignments,
+                        where_clause,
+                    })
                 }
             },
             _ => None,
