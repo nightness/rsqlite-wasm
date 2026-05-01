@@ -446,5 +446,5 @@ fn describe_plan_recursive(
 }
 
 #[cfg(test)]
-#[path = "database_tests.rs"]
+#[path = "database_tests/mod.rs"]
 mod tests;
