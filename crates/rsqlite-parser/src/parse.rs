@@ -66,17 +66,22 @@ fn parse_create_virtual_table(sql: &str) -> Option<sqlparser::ast::Statement> {
     if !upper_after.starts_with("USING") {
         return None;
     }
-    let after_using = after_name["USING".len()..].trim_start();
-    let paren = after_using.find('(')?;
-    let module = after_using[..paren].trim();
+    let after_using = after_name["USING".len()..].trim_start().trim_end_matches(';').trim();
+    // Module-arg parens are optional — modules with no args (e.g.
+    // `kvstore`) write `USING kvstore` and we treat that as args="".
+    let (module, raw_args) = match after_using.find('(') {
+        Some(paren) => {
+            let close = after_using.rfind(')')?;
+            if close <= paren {
+                return None;
+            }
+            (after_using[..paren].trim(), &after_using[paren + 1..close])
+        }
+        None => (after_using, ""),
+    };
     if module.is_empty() {
         return None;
     }
-    let close = after_using.rfind(')')?;
-    if close <= paren {
-        return None;
-    }
-    let raw_args = &after_using[paren + 1..close];
 
     // Encode as `<if_not_exists>|<name>|<module>|<args>` so the planner
     // can split on '|'.

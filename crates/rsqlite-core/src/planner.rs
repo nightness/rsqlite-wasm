@@ -198,6 +198,14 @@ pub enum Plan {
         args: Vec<String>,
         if_not_exists: bool,
     },
+    /// INSERT INTO a virtual table. Each row is a list of column-aligned
+    /// expressions; the executor invokes the module's `insert` hook
+    /// per row. UPDATE/DELETE on virtual tables are not yet supported.
+    VirtualInsert {
+        table: String,
+        columns: Vec<String>,
+        rows: Vec<Vec<PlanExpr>>,
+    },
     IndexScan {
         table: String,
         table_root_page: u32,
@@ -2289,6 +2297,36 @@ fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
             ));
         }
     };
+
+    // Virtual-table INSERT: route to a separate plan variant so the
+    // executor can dispatch through the module's `insert` hook.
+    if let Some(vt) = catalog.virtual_tables.get(&table_name.to_lowercase()) {
+        let cols = vt.instance.columns();
+        let rows = match insert.source.as_deref() {
+            Some(query) => match query.body.as_ref() {
+                ast::SetExpr::Values(values) => values
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.iter()
+                            .map(|e| plan_expr(e, &[], catalog))
+                            .collect::<Result<Vec<_>>>()
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                _ => {
+                    return Err(Error::Other(
+                        "INSERT into virtual table only supports VALUES (...)".into(),
+                    ));
+                }
+            },
+            None => Vec::new(),
+        };
+        return Ok(Plan::VirtualInsert {
+            table: vt.name.clone(),
+            columns: cols,
+            rows,
+        });
+    }
 
     let table_def = catalog
         .get_table(&table_name)

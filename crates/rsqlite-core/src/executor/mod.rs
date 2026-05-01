@@ -311,12 +311,7 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             window_exprs,
             output_columns,
         } => execute_window(input, window_exprs, output_columns, pager, catalog),
-        Plan::VirtualScan {
-            module,
-            args,
-            columns,
-            ..
-        } => execute_virtual_scan(module, args, columns),
+        Plan::VirtualScan { table, columns, .. } => execute_virtual_scan(table, columns, catalog),
         Plan::CreateTable(_)
         | Plan::CreateIndex(_)
         | Plan::Insert(_)
@@ -342,27 +337,52 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
         | Plan::DropTrigger { .. }
         | Plan::AttachDatabase { .. }
         | Plan::DetachDatabase { .. }
-        | Plan::CreateVirtualTable { .. } => Err(Error::Other(
+        | Plan::CreateVirtualTable { .. }
+        | Plan::VirtualInsert { .. } => Err(Error::Other(
             "use execute_mut for DDL/DML statements".to_string(),
         )),
     }
 }
 
 fn execute_virtual_scan(
-    module: &str,
-    args: &[String],
+    table_name: &str,
     columns: &[crate::planner::ColumnRef],
+    catalog: &Catalog,
 ) -> Result<QueryResult> {
-    let module_def = crate::vtab::lookup_module(module).ok_or_else(|| {
-        Error::Other(format!("virtual-table module not registered: {module}"))
-    })?;
-    let table = module_def.create("", args)?;
-    let rows = table.scan()?;
+    let vt = catalog
+        .virtual_tables
+        .get(&table_name.to_lowercase())
+        .ok_or_else(|| Error::Other(format!("virtual table not found: {table_name}")))?;
+    let rows = vt.instance.scan()?;
     let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
     Ok(QueryResult {
         columns: column_names,
         rows,
     })
+}
+
+fn execute_virtual_insert(
+    table_name: &str,
+    _columns: &[String],
+    rows: &[Vec<crate::planner::PlanExpr>],
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<ExecResult> {
+    let vt = catalog
+        .virtual_tables
+        .get(&table_name.to_lowercase())
+        .ok_or_else(|| Error::Other(format!("virtual table not found: {table_name}")))?;
+    let empty_row = Row::new(vec![]);
+    let mut affected = 0u64;
+    for row in rows {
+        let values: Vec<crate::types::Value> = row
+            .iter()
+            .map(|e| eval::eval_expr(e, &empty_row, &[], pager, catalog))
+            .collect::<Result<Vec<_>>>()?;
+        vt.instance.insert(&values)?;
+        affected += 1;
+    }
+    Ok(ExecResult::affected(affected))
 }
 
 fn execute_create_virtual_table(
@@ -384,16 +404,17 @@ fn execute_create_virtual_table(
     let module_def = crate::vtab::lookup_module(module).ok_or_else(|| {
         Error::Other(format!("virtual-table module not registered: {module}"))
     })?;
-    // Probe the args by doing a one-shot create + drop. This catches
-    // arg-shape errors (wrong count, non-numeric where numeric expected)
-    // at registration time.
-    let _probe = module_def.create(name, args)?;
+    // Build the live instance once and stash it in the catalog so
+    // stateful modules see all subsequent reads/writes against the
+    // same backing data.
+    let instance = module_def.create(name, args)?;
     catalog.virtual_tables.insert(
         key,
         crate::catalog::VirtualTableDef {
             name: name.to_string(),
             module: module.to_string(),
             args: args.to_vec(),
+            instance,
         },
     );
     Ok(ExecResult::affected(0))
@@ -440,6 +461,11 @@ pub fn execute_mut(plan: &Plan, pager: &mut Pager, catalog: &mut Catalog) -> Res
             args,
             if_not_exists,
         } => execute_create_virtual_table(name, module, args, *if_not_exists, catalog),
+        Plan::VirtualInsert {
+            table,
+            columns,
+            rows,
+        } => execute_virtual_insert(table, columns, rows, pager, catalog),
         // REINDEX is currently a no-op: our btree implementation doesn't
         // suffer from the corruption modes (collation changes, etc.) that
         // real SQLite addresses with REINDEX. Accepted for tool compat.

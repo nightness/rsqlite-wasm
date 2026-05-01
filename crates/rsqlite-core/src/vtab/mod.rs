@@ -19,8 +19,8 @@
 //! generator) and to give external add-ons (FTS5, R-Tree, HNSW vector
 //! index) somewhere to land.
 
-use std::collections::HashMap;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use rsqlite_storage::codec::Value;
@@ -36,21 +36,36 @@ pub trait Module: 'static {
 
     /// Build a virtual-table instance for one `CREATE VIRTUAL TABLE`
     /// statement. `args` are the comma-separated tokens between the
-    /// parentheses, with whitespace trimmed.
-    fn create(&self, table_name: &str, args: &[String]) -> Result<Box<dyn VirtualTable>>;
+    /// parentheses, with whitespace trimmed. The returned instance is
+    /// kept alive by the catalog and shared across queries — modules
+    /// that hold mutable state (anything supporting INSERT) must use
+    /// interior mutability (`RefCell`, `Mutex`).
+    fn create(&self, table_name: &str, args: &[String]) -> Result<Rc<dyn VirtualTable>>;
 }
 
-/// A live virtual table. Cloned/recreated cheaply (modules typically
-/// hold an Rc<inner>) — the planner asks for a fresh handle per scan.
+/// A live virtual table. The catalog stores one shared `Rc<dyn
+/// VirtualTable>` per CREATE VIRTUAL TABLE, so all `&self` methods may
+/// be called concurrently across queries. Implementations needing
+/// mutable state should wrap that state in interior-mutability cells.
 pub trait VirtualTable {
     /// Names of the columns this table exposes, in declaration order.
     /// Matches the column list `xColumn` would project for SQLite.
-    fn columns(&self) -> &[String];
+    fn columns(&self) -> Vec<String>;
 
     /// Produce all rows. The executor may wrap the result in a Filter
     /// if there's a WHERE clause; a future `xBestIndex` hook would let
     /// the module push filters down itself.
     fn scan(&self) -> Result<Vec<Row>>;
+
+    /// Optional INSERT hook — `xUpdate` in SQLite vtab terms. Default
+    /// is read-only; modules that override this can be the target of
+    /// `INSERT INTO vt VALUES (...)`. Returns the rowid of the new
+    /// row. The values slice is in column order.
+    fn insert(&self, _values: &[Value]) -> Result<i64> {
+        Err(crate::error::Error::Other(
+            "this virtual table is read-only".into(),
+        ))
+    }
 }
 
 thread_local! {
@@ -63,6 +78,7 @@ fn default_modules() -> HashMap<String, Rc<dyn Module>> {
     let series = Rc::new(SeriesModule) as Rc<dyn Module>;
     map.insert("series".to_string(), series.clone());
     map.insert("generate_series".to_string(), series);
+    map.insert("kvstore".to_string(), Rc::new(KvStoreModule));
     map
 }
 
@@ -101,7 +117,7 @@ impl Module for SeriesModule {
         "series"
     }
 
-    fn create(&self, _table_name: &str, args: &[String]) -> Result<Box<dyn VirtualTable>> {
+    fn create(&self, _table_name: &str, args: &[String]) -> Result<Rc<dyn VirtualTable>> {
         let parse_int = |s: &str| -> Result<i64> {
             s.parse::<i64>().map_err(|_| {
                 crate::error::Error::Other(format!(
@@ -118,7 +134,7 @@ impl Module for SeriesModule {
                 ));
             }
         };
-        Ok(Box::new(SeriesTable { start, stop, step }))
+        Ok(Rc::new(SeriesTable { start, stop, step }))
     }
 }
 
@@ -129,12 +145,11 @@ struct SeriesTable {
 }
 
 impl VirtualTable for SeriesTable {
-    fn columns(&self) -> &[String] {
-        // Static column list — every series instance exposes one column,
-        // `value`. Matches SQLite's generate_series schema (without the
-        // optional `start`/`stop`/`step` reflection columns).
-        static COLS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
-        COLS.get_or_init(|| vec!["value".to_string()])
+    fn columns(&self) -> Vec<String> {
+        // Every series instance exposes one column, `value`. Matches
+        // SQLite's generate_series schema (without the optional
+        // `start`/`stop`/`step` reflection columns).
+        vec!["value".to_string()]
     }
 
     fn scan(&self) -> Result<Vec<Row>> {
@@ -157,6 +172,57 @@ impl VirtualTable for SeriesTable {
             }
         }
         Ok(rows)
+    }
+}
+
+// ── Built-in: `kvstore` ───────────────────────────────────────────────
+
+/// Simple in-memory key/value store. Demonstrates the writeable
+/// virtual-table path: `CREATE VIRTUAL TABLE kv USING kvstore;`
+/// declares a two-column table `(key TEXT, value)`. Rows are
+/// appended in insertion order; rowid = position + 1.
+struct KvStoreModule;
+
+impl Module for KvStoreModule {
+    fn name(&self) -> &str {
+        "kvstore"
+    }
+
+    fn create(&self, _table_name: &str, _args: &[String]) -> Result<Rc<dyn VirtualTable>> {
+        Ok(Rc::new(KvStoreTable {
+            rows: RefCell::new(Vec::new()),
+        }))
+    }
+}
+
+struct KvStoreTable {
+    rows: RefCell<Vec<(Value, Value)>>,
+}
+
+impl VirtualTable for KvStoreTable {
+    fn columns(&self) -> Vec<String> {
+        vec!["key".to_string(), "value".to_string()]
+    }
+
+    fn scan(&self) -> Result<Vec<Row>> {
+        Ok(self
+            .rows
+            .borrow()
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| Row::with_rowid(vec![k.clone(), v.clone()], (i as i64) + 1))
+            .collect())
+    }
+
+    fn insert(&self, values: &[Value]) -> Result<i64> {
+        if values.len() != 2 {
+            return Err(crate::error::Error::Other(
+                "kvstore.insert: expected 2 values (key, value)".into(),
+            ));
+        }
+        let mut rows = self.rows.borrow_mut();
+        rows.push((values[0].clone(), values[1].clone()));
+        Ok(rows.len() as i64)
     }
 }
 
@@ -217,7 +283,7 @@ mod tests {
             fn name(&self) -> &str {
                 "stub_module"
             }
-            fn create(&self, _t: &str, _a: &[String]) -> Result<Box<dyn VirtualTable>> {
+            fn create(&self, _t: &str, _a: &[String]) -> Result<Rc<dyn VirtualTable>> {
                 Err(crate::error::Error::Other("not implemented".into()))
             }
         }
@@ -226,5 +292,48 @@ mod tests {
         assert!(lookup_module("STUB_MODULE").is_some());
         reset_to_defaults();
         assert!(lookup_module("stub_module").is_none());
+    }
+
+    #[test]
+    fn writeable_module_supports_insert() {
+        use std::cell::RefCell;
+        struct MemTable {
+            cols: Vec<String>,
+            rows: RefCell<Vec<Row>>,
+        }
+        impl VirtualTable for MemTable {
+            fn columns(&self) -> Vec<String> {
+                self.cols.clone()
+            }
+            fn scan(&self) -> Result<Vec<Row>> {
+                Ok(self.rows.borrow().clone())
+            }
+            fn insert(&self, values: &[Value]) -> Result<i64> {
+                let mut r = self.rows.borrow_mut();
+                let id = r.len() as i64 + 1;
+                r.push(Row::with_rowid(values.to_vec(), id));
+                Ok(id)
+            }
+        }
+        struct MemModule;
+        impl Module for MemModule {
+            fn name(&self) -> &str {
+                "memtab"
+            }
+            fn create(&self, _t: &str, _a: &[String]) -> Result<Rc<dyn VirtualTable>> {
+                Ok(Rc::new(MemTable {
+                    cols: vec!["k".into(), "v".into()],
+                    rows: RefCell::new(Vec::new()),
+                }))
+            }
+        }
+        register_module(Rc::new(MemModule));
+        let table = lookup_module("memtab").unwrap().create("t", &[]).unwrap();
+        let id = table
+            .insert(&[Value::Integer(7), Value::Text("hello".into())])
+            .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(table.scan().unwrap().len(), 1);
+        reset_to_defaults();
     }
 }

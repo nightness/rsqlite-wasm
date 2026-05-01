@@ -165,7 +165,7 @@ pub struct IndexStat {
     pub avg_per_prefix: Vec<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VirtualTableDef {
     pub name: String,
     pub module: String,
@@ -173,6 +173,21 @@ pub struct VirtualTableDef {
     /// module(<args>)`. Stored verbatim and re-split per-instance so
     /// modules with quoted arguments stay intact.
     pub args: Vec<String>,
+    /// Live module instance — created once at CREATE VIRTUAL TABLE
+    /// time and shared across queries so stateful modules (anything
+    /// supporting INSERT) keep their data between scans.
+    pub instance: std::rc::Rc<dyn crate::vtab::VirtualTable>,
+}
+
+impl std::fmt::Debug for VirtualTableDef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualTableDef")
+            .field("name", &self.name)
+            .field("module", &self.module)
+            .field("args", &self.args)
+            .field("instance", &"<dyn VirtualTable>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Default)]

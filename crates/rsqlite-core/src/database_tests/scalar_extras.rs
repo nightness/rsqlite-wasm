@@ -1071,6 +1071,44 @@ fn create_virtual_table_if_not_exists_skips_duplicate() {
         .unwrap();
 }
 
+// ── Writeable virtual tables (kvstore) ────────────────────────────────
+
+#[test]
+fn kvstore_round_trip_insert_and_select() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE kv USING kvstore").unwrap();
+    db.execute("INSERT INTO kv VALUES ('alpha', 1)").unwrap();
+    db.execute("INSERT INTO kv VALUES ('beta', 2)").unwrap();
+    db.execute("INSERT INTO kv VALUES ('gamma', 3)").unwrap();
+    let r = db.query("SELECT key, value FROM kv ORDER BY key").unwrap();
+    assert_eq!(r.rows.len(), 3);
+    assert_eq!(r.rows[0].values[0], Value::Text("alpha".to_string()));
+    assert_eq!(r.rows[0].values[1], Value::Integer(1));
+    assert_eq!(r.rows[2].values[0], Value::Text("gamma".to_string()));
+}
+
+#[test]
+fn kvstore_where_filters_inserted_rows() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE kv USING kvstore").unwrap();
+    db.execute("INSERT INTO kv VALUES ('a', 1), ('b', 2), ('c', 3)")
+        .unwrap();
+    let r = db.query("SELECT key FROM kv WHERE value >= 2 ORDER BY key").unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0].values[0], Value::Text("b".to_string()));
+    assert_eq!(r.rows[1].values[0], Value::Text("c".to_string()));
+}
+
+#[test]
+fn series_module_rejects_insert() {
+    // The series module is read-only — INSERT should surface as a
+    // query error, not silently succeed.
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE s USING series(1, 5)").unwrap();
+    let res = db.execute("INSERT INTO s VALUES (99)");
+    assert!(res.is_err());
+}
+
 // ── Multi-column expression-index lookup ─────────────────────────────
 
 #[test]
