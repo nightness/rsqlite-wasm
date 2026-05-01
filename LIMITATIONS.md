@@ -57,10 +57,10 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 - **Expression indexes** (`CREATE INDEX ... ON t(lower(name))`) build
   with the expression evaluated against each row, and INSERT /
   UPDATE / DELETE keep the index in sync. The planner picks the
-  index when a `<idx_expr> = <literal>` conjunct appears in the WHERE
-  (e.g. `WHERE lower(name) = 'bob'`). Single-column expression
-  indexes only for now; multi-column expression indexes still fall
-  back to a full table scan.
+  index when each indexed column has a matching `<idx_expr> =
+  <literal>` conjunct in the WHERE — single-column and multi-column
+  forms both work (e.g. `WHERE lower(name) = 'bob' AND
+  lower(email) = 'b@y.com'`).
 
 ## DML
 

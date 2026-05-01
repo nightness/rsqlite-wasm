@@ -999,6 +999,50 @@ fn bare_rowid_filter_without_alias() {
     assert_eq!(r.rows[0].values[0], Value::Text("second".to_string()));
 }
 
+// ── Multi-column expression-index lookup ─────────────────────────────
+
+#[test]
+fn multi_column_expression_index_picked() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, email TEXT)").unwrap();
+    db.execute("CREATE INDEX idx_lower_pair ON t(lower(name), lower(email))")
+        .unwrap();
+    db.execute(
+        "INSERT INTO t VALUES \
+         (1, 'Alice', 'A@x.com'), (2, 'BOB', 'B@y.com'), (3, 'carol', 'c@z.com')",
+    )
+    .unwrap();
+
+    let r = db
+        .query("SELECT id FROM t WHERE lower(name) = 'bob' AND lower(email) = 'b@y.com'")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], Value::Integer(2));
+
+    let plan = db
+        .query(
+            "EXPLAIN QUERY PLAN SELECT id FROM t \
+             WHERE lower(name) = 'bob' AND lower(email) = 'b@y.com'",
+        )
+        .unwrap();
+    let plan_text = plan
+        .rows
+        .iter()
+        .map(|r| {
+            r.values
+                .iter()
+                .map(|v| format!("{v:?}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("idx_lower_pair") || plan_text.contains("INDEX"),
+        "EXPLAIN didn't show the multi-column expression index being used: {plan_text}"
+    );
+}
+
 // ── Cost-aware planner picks the more-selective index ────────────────
 
 #[test]

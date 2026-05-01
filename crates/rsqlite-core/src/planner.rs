@@ -1806,54 +1806,82 @@ fn try_expression_index_scan(
         if !idx_def.table_name.eq_ignore_ascii_case(table_name) {
             continue;
         }
-        if idx_def.columns.len() != 1 {
+        if idx_def.columns.is_empty() {
             continue;
         }
         if idx_def.predicate.is_some() {
             continue;
         }
-        let col_src = &idx_def.columns[0];
-        // Plain-column indexes already covered by try_index_scan's main path.
-        if all_columns
-            .iter()
-            .any(|c| c.name.eq_ignore_ascii_case(col_src))
-        {
+        // At least one column must be an expression (not a plain table
+        // column) — otherwise the main `try_index_scan` path already
+        // handles this index.
+        let any_expr = idx_def.columns.iter().any(|src| {
+            !all_columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(src))
+        });
+        if !any_expr {
             continue;
         }
 
-        // Parse the index's expression source.
-        let parsed = match rsqlite_parser::parse::parse_sql(&format!("SELECT {col_src}")) {
-            Ok(p) => p,
-            Err(_) => continue,
-        };
-        let expr_ast = parsed.into_iter().next().and_then(|stmt| {
-            if let sqlparser::ast::Statement::Query(q) = stmt {
-                if let sqlparser::ast::SetExpr::Select(sel) = *q.body {
-                    return sel.projection.into_iter().next().and_then(|item| {
-                        if let sqlparser::ast::SelectItem::UnnamedExpr(e) = item {
-                            Some(e)
-                        } else {
-                            None
-                        }
-                    });
+        // For each indexed column (expression OR plain), find a matching
+        // equality conjunct in the WHERE. Plain columns can match either
+        // a plain `col = ?` from `general_eqs` or be skipped onto the
+        // Filter wrap; expression columns must structurally match.
+        let mut lookup_values: Vec<PlanExpr> = Vec::new();
+        let mut all_matched = true;
+        for col_src in &idx_def.columns {
+            let parsed = match rsqlite_parser::parse::parse_sql(&format!("SELECT {col_src}")) {
+                Ok(p) => p,
+                Err(_) => {
+                    all_matched = false;
+                    break;
+                }
+            };
+            let expr_ast = parsed.into_iter().next().and_then(|stmt| {
+                if let sqlparser::ast::Statement::Query(q) = stmt {
+                    if let sqlparser::ast::SetExpr::Select(sel) = *q.body {
+                        return sel.projection.into_iter().next().and_then(|item| {
+                            if let sqlparser::ast::SelectItem::UnnamedExpr(e) = item {
+                                Some(e)
+                            } else {
+                                None
+                            }
+                        });
+                    }
+                }
+                None
+            });
+            let Some(expr_ast) = expr_ast else {
+                all_matched = false;
+                break;
+            };
+            let Ok(idx_expr) = plan_expr(&expr_ast, all_columns, catalog) else {
+                all_matched = false;
+                break;
+            };
+            let matched_value = general_eqs
+                .iter()
+                .find(|(lhs, _)| plan_exprs_structurally_equal(lhs, &idx_expr))
+                .map(|(_, rhs)| rhs.clone());
+            match matched_value {
+                Some(v) => lookup_values.push(v),
+                None => {
+                    all_matched = false;
+                    break;
                 }
             }
-            None
-        });
-        let Some(expr_ast) = expr_ast else { continue };
-        let Ok(idx_expr) = plan_expr(&expr_ast, all_columns, catalog) else {
-            continue;
-        };
+        }
 
-        for (lhs, rhs) in &general_eqs {
-            if plan_exprs_structurally_equal(lhs, &idx_expr) {
+        if all_matched {
+            {
                 let index_scan = Plan::IndexScan {
                     table: table_name.to_string(),
                     table_root_page: table_root,
                     index_root_page: idx_def.root_page,
                     columns: columns.to_vec(),
                     index_columns: idx_def.columns.clone(),
-                    lookup_values: vec![rhs.clone()],
+                    lookup_values,
                 };
                 // Wrap with the full predicate as a Filter; the index narrows
                 // the candidate set but doesn't strip already-matched
