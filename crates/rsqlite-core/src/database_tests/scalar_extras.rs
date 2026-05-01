@@ -1183,6 +1183,62 @@ fn series_module_rejects_insert() {
     assert!(res.is_err());
 }
 
+// ── WITHOUT ROWID tables (syntax accepted, PK uniqueness enforced) ────
+
+#[test]
+fn create_without_rowid_with_text_pk_works() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID")
+        .unwrap();
+    db.execute("INSERT INTO kv VALUES ('alpha', '1'), ('beta', '2')")
+        .unwrap();
+    let r = db.query("SELECT k, v FROM kv ORDER BY k").unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0].values[0], Value::Text("alpha".to_string()));
+    assert_eq!(r.rows[1].values[0], Value::Text("beta".to_string()));
+}
+
+#[test]
+fn without_rowid_pk_uniqueness_is_enforced() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT) WITHOUT ROWID")
+        .unwrap();
+    db.execute("INSERT INTO kv VALUES ('alpha', '1')").unwrap();
+    let dup = db.execute("INSERT INTO kv VALUES ('alpha', '2')");
+    assert!(dup.is_err(), "expected unique-PK violation, got: {dup:?}");
+}
+
+#[test]
+fn without_rowid_requires_a_primary_key() {
+    let mut db = fresh();
+    let res = db.execute("CREATE TABLE bad (a TEXT, b TEXT) WITHOUT ROWID");
+    assert!(
+        res.is_err(),
+        "WITHOUT ROWID without PRIMARY KEY should be rejected"
+    );
+}
+
+#[test]
+fn without_rowid_flag_recorded_on_catalog() {
+    let mut db = fresh();
+    db.execute(
+        "CREATE TABLE composite (a TEXT, b TEXT, payload TEXT, \
+         PRIMARY KEY (a, b)) WITHOUT ROWID",
+    )
+    .unwrap();
+    let table = db.catalog().get_table("composite").unwrap();
+    assert!(table.without_rowid, "catalog should track WITHOUT ROWID");
+}
+
+#[test]
+fn regular_table_does_not_set_without_rowid_flag() {
+    let mut db = fresh();
+    db.execute("CREATE TABLE plain (id INTEGER PRIMARY KEY, x TEXT)")
+        .unwrap();
+    let table = db.catalog().get_table("plain").unwrap();
+    assert!(!table.without_rowid);
+}
+
 // ── rtree virtual table (multi-dimensional bounding boxes) ───────────
 
 #[test]

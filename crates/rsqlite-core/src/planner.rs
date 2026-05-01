@@ -27,6 +27,13 @@ pub struct CreateTablePlan {
     pub sql: String,
     pub columns: Vec<CreateColumnDef>,
     pub if_not_exists: bool,
+    /// Set when the user wrote `CREATE TABLE … WITHOUT ROWID`. Stored on
+    /// the catalog so the SQL is preserved (and external tools that read
+    /// `sqlite_schema` see it). Storage is still rowid-keyed for v0.1 —
+    /// the PK uniqueness constraint plus the existing composite-PK
+    /// uniqueness check give the same query semantics; only on-disk
+    /// btree shape differs from SQLite's WITHOUT ROWID layout.
+    pub without_rowid: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1604,11 +1611,25 @@ fn plan_create_table(ct: &ast::CreateTable, catalog: &Catalog) -> Result<Plan> {
 
     let sql = format!("{ct}");
 
+    if ct.without_rowid {
+        // SQLite requires WITHOUT ROWID tables to declare a PRIMARY KEY
+        // (composite or single-column). Reject the missing-PK case at
+        // plan time so the error is precise instead of surfacing later.
+        let has_any_pk = !table_pk_cols.is_empty()
+            || columns.iter().any(|c| c.is_primary_key);
+        if !has_any_pk {
+            return Err(Error::Other(format!(
+                "table {table_name} declared WITHOUT ROWID but has no PRIMARY KEY"
+            )));
+        }
+    }
+
     Ok(Plan::CreateTable(CreateTablePlan {
         table_name,
         sql,
         columns,
         if_not_exists: ct.if_not_exists,
+        without_rowid: ct.without_rowid,
     }))
 }
 

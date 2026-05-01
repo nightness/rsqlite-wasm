@@ -121,7 +121,14 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
   yet supported through the cross-thread `WorkerDatabase` proxy because
   callbacks can't be `postMessage`-serialized. Async UDFs are deferred
   to a future release.
-- **`WITHOUT ROWID` tables** — storage layer assumes rowid keys.
+- **`WITHOUT ROWID` tables** — syntax accepted; the catalog tracks
+  the flag and the planner enforces that a PRIMARY KEY is declared.
+  Query semantics match a regular rowid table because PK uniqueness
+  is checked the same way (composite-PK as a tuple). The on-disk
+  btree shape is still rowid-keyed, so a database created here with
+  `WITHOUT ROWID` won't load that specific table in vanilla
+  `sqlite3` — the rest of the file still does. Real
+  composite-PK-as-btree-key storage is a v0.2 follow-up.
 
 ## Known follow-ups
 
@@ -133,4 +140,7 @@ These are tracked as v0.2 candidates:
 3. FTS5 module (tokenizer + inverted index + BM25). Real HNSW
    graph + R*-Tree split heuristic (the brute-force `vec_index`
    and `rtree` shipped today are API-shaped for the swap).
-4. WITHOUT ROWID tables — storage layer rewrite deferred to v0.2.
+4. WITHOUT ROWID storage rewrite — the syntax is accepted and PK
+   uniqueness enforced today, but real composite-PK-as-btree-key
+   storage (for SQLite file-format compat on those tables) is
+   deferred to v0.2.

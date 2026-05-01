@@ -81,6 +81,14 @@ pub struct TableDef {
     /// individually marked `is_unique` because the constraint applies to
     /// the combination, not each axis.
     pub pk_columns: Vec<String>,
+    /// Set when the table was declared `CREATE TABLE … WITHOUT ROWID`.
+    /// Storage is still rowid-keyed for v0.1 — uniqueness of the PK is
+    /// enforced via the existing PRIMARY KEY checks, so query semantics
+    /// match. Tracking the flag lets us preserve the original SQL on
+    /// `sqlite_schema`-format export and surface it via PRAGMA, even
+    /// though the on-disk btree shape isn't yet a SQLite-compatible
+    /// WITHOUT ROWID table.
+    pub without_rowid: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +324,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 has_autoincrement: false,
                 foreign_keys: vec![],
                 pk_columns: vec![],
+                without_rowid: false,
             }));
         }
     };
@@ -512,6 +521,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
             has_autoincrement,
             foreign_keys,
             pk_columns,
+            without_rowid: ct.without_rowid,
         }))
     } else {
         Ok(None)
