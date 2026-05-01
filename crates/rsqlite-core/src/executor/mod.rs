@@ -11,6 +11,7 @@ mod query;
 mod scan;
 mod sort;
 pub(crate) mod state;
+mod table_function;
 mod trigger;
 mod update;
 mod vacuum;
@@ -70,6 +71,9 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             columns: vec![],
             rows: vec![Row { values: vec![] }],
         }),
+        Plan::TableFunction { name, args } => {
+            table_function::execute_table_function(name, args, pager, catalog)
+        }
         Plan::RecursiveCte {
             name,
             column_names,

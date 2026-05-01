@@ -17,7 +17,8 @@ use super::constraints::{
 };
 use super::eval::eval_expr;
 use super::helpers::{
-    build_index_key, build_returning_result, get_table_indexes, row_values_for_rowid,
+    apply_generated_columns, build_index_key, build_returning_result, get_table_indexes,
+    row_values_for_rowid,
 };
 use super::state::set_changes;
 use super::trigger::fire_triggers;
@@ -27,6 +28,24 @@ pub(super) fn execute_update(
     pager: &mut Pager,
     catalog: &Catalog,
 ) -> Result<ExecResult> {
+    // Reject explicit UPDATE of a generated column.
+    if let Some(td) = catalog.get_table(&plan.table_name) {
+        for (col_name, _) in &plan.assignments {
+            if let Some(c) = td
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(col_name))
+            {
+                if c.generated.is_some() {
+                    return Err(Error::Other(format!(
+                        "cannot UPDATE generated column {}.{}",
+                        plan.table_name, c.name
+                    )));
+                }
+            }
+        }
+    }
+
     let column_names: Vec<String> = plan.table_columns.iter().map(|c| c.name.clone()).collect();
 
     let mut cursor = BTreeCursor::new(pager, plan.root_page);
@@ -136,6 +155,13 @@ pub(super) fn execute_update(
                     new_values[col_idx] =
                         eval_expr(expr, &combined_row, &combined_column_names, pager, catalog)?;
                 }
+                apply_generated_columns(
+                    &mut new_values,
+                    &plan.table_name,
+                    &plan.table_columns,
+                    pager,
+                    catalog,
+                )?;
                 check_not_null_constraints(&new_values, &plan.table_columns, &plan.table_name)?;
                 check_unique_constraints(
                     &new_values,
@@ -183,6 +209,13 @@ pub(super) fn execute_update(
                     .ok_or_else(|| Error::Other(format!("unknown column: {col_name}")))?;
                 new_values[col_idx] = eval_expr(expr, &row, &column_names, pager, catalog)?;
             }
+            apply_generated_columns(
+                &mut new_values,
+                &plan.table_name,
+                &plan.table_columns,
+                pager,
+                catalog,
+            )?;
             check_not_null_constraints(&new_values, &plan.table_columns, &plan.table_name)?;
             check_unique_constraints(
                 &new_values,

@@ -1821,3 +1821,141 @@ fn default_persists_across_reopen() {
     }
     let _ = std::fs::remove_file(db_path);
 }
+
+#[test]
+fn generated_column_stored_basic() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute(
+        "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) STORED)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (a, b) VALUES (3, 4)").unwrap();
+    let r = db.query("SELECT c FROM t").unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(7));
+}
+
+#[test]
+fn generated_column_recomputed_on_update() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute(
+        "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a * b) STORED)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (a, b) VALUES (2, 5)").unwrap();
+    db.execute("UPDATE t SET a = 10").unwrap();
+    let r = db.query("SELECT c FROM t").unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(50));
+}
+
+#[test]
+fn generated_column_rejects_explicit_insert() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute("CREATE TABLE t (a INTEGER, c INTEGER GENERATED ALWAYS AS (a + 1) STORED)")
+        .unwrap();
+    let res = db.execute("INSERT INTO t (a, c) VALUES (1, 99)");
+    assert!(res.is_err());
+}
+
+#[test]
+fn generated_column_rejects_explicit_update() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute("CREATE TABLE t (a INTEGER, c INTEGER GENERATED ALWAYS AS (a + 1) STORED)")
+        .unwrap();
+    db.execute("INSERT INTO t (a) VALUES (1)").unwrap();
+    let res = db.execute("UPDATE t SET c = 99");
+    assert!(res.is_err());
+}
+
+#[test]
+fn generated_column_in_pragma_table_xinfo() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute(
+        "CREATE TABLE t (a INTEGER, c INTEGER GENERATED ALWAYS AS (a * 2) STORED)",
+    )
+    .unwrap();
+    let r = db.query("PRAGMA table_xinfo(t)").unwrap();
+    let c_row = r
+        .rows
+        .iter()
+        .find(|row| matches!(&row.values[1], crate::types::Value::Text(s) if s == "c"))
+        .unwrap();
+    // hidden = 2 for STORED generated columns.
+    assert_eq!(c_row.values[6], crate::types::Value::Integer(2));
+}
+
+#[test]
+fn json_each_array_basic() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    let r = db
+        .query("SELECT key, value FROM json_each('[10, 20, 30]')")
+        .unwrap();
+    assert_eq!(r.rows.len(), 3);
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(0));
+    assert_eq!(r.rows[0].values[1], crate::types::Value::Integer(10));
+    assert_eq!(r.rows[2].values[1], crate::types::Value::Integer(30));
+}
+
+#[test]
+fn json_each_object_basic() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    let r = db
+        .query(r#"SELECT key, value FROM json_each('{"a":1,"b":"two"}')"#)
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    let keys: Vec<String> = r
+        .rows
+        .iter()
+        .map(|row| match &row.values[0] {
+            crate::types::Value::Text(s) => s.clone(),
+            _ => String::new(),
+        })
+        .collect();
+    assert!(keys.contains(&"a".to_string()));
+    assert!(keys.contains(&"b".to_string()));
+}
+
+#[test]
+fn json_each_with_count() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    let r = db
+        .query("SELECT COUNT(*) FROM json_each('[1, 2, 3, 4, 5]')")
+        .unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(5));
+}
+
+#[test]
+fn json_each_empty_array() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    let r = db.query("SELECT key FROM json_each('[]')").unwrap();
+    assert_eq!(r.rows.len(), 0);
+}
+
+#[test]
+fn json_tree_recurses() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    let r = db
+        .query(r#"SELECT COUNT(*) FROM json_tree('{"a":[1,2],"b":{"c":3}}')"#)
+        .unwrap();
+    // Rows: root, a, [1], [2], b, c — 6 nodes total.
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(6));
+}
+
+#[test]
+fn json_each_invalid_json_returns_empty() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    let r = db
+        .query("SELECT COUNT(*) FROM json_each('not json')")
+        .unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(0));
+}

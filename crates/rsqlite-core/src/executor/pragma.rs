@@ -263,19 +263,28 @@ pub fn execute_pragma(
             let rows = table
                 .columns
                 .iter()
-                .map(|col| Row {
-                    values: vec![
-                        Value::Integer(col.column_index as i64),
-                        Value::Text(col.name.clone()),
-                        Value::Text(col.type_name.clone()),
-                        Value::Integer(if col.nullable { 0 } else { 1 }),
-                        col.default_expr
-                            .as_ref()
-                            .map(|s| Value::Text(s.clone()))
-                            .unwrap_or(Value::Null),
-                        Value::Integer(if col.is_primary_key { 1 } else { 0 }),
-                        Value::Integer(0),
-                    ],
+                .map(|col| {
+                    // hidden = 2 for STORED generated, 3 for VIRTUAL (matches
+                    // SQLite's encoding); 0 for ordinary columns.
+                    let hidden = match &col.generated {
+                        Some(g) if g.stored => 2,
+                        Some(_) => 3,
+                        None => 0,
+                    };
+                    Row {
+                        values: vec![
+                            Value::Integer(col.column_index as i64),
+                            Value::Text(col.name.clone()),
+                            Value::Text(col.type_name.clone()),
+                            Value::Integer(if col.nullable { 0 } else { 1 }),
+                            col.default_expr
+                                .as_ref()
+                                .map(|s| Value::Text(s.clone()))
+                                .unwrap_or(Value::Null),
+                            Value::Integer(if col.is_primary_key { 1 } else { 0 }),
+                            Value::Integer(hidden),
+                        ],
+                    }
                 })
                 .collect();
             Ok(QueryResult { columns, rows })

@@ -241,6 +241,81 @@ pub(super) fn build_returning_result(
     Ok(QueryResult { columns, rows })
 }
 
+/// Compute GENERATED ALWAYS AS (...) column values for the row. Generated
+/// columns must not have been set explicitly — that would error before this
+/// runs. Both STORED and VIRTUAL flavors are computed here; the VIRTUAL
+/// distinction would only matter once we read directly from the btree
+/// without re-deriving, which we don't yet do.
+pub(super) fn apply_generated_columns(
+    values: &mut [Value],
+    table_name: &str,
+    table_columns: &[ColumnRef],
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<()> {
+    let table_def = match catalog.get_table(table_name) {
+        Some(td) => td,
+        None => return Ok(()),
+    };
+    let col_names: Vec<String> = table_columns.iter().map(|c| c.name.clone()).collect();
+
+    for (i, col) in table_columns.iter().enumerate() {
+        let cat_col = match table_def
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&col.name))
+        {
+            Some(c) => c,
+            None => continue,
+        };
+        let gen_col = match &cat_col.generated {
+            Some(g) => g,
+            None => continue,
+        };
+
+        let parsed = match rsqlite_parser::parse::parse_sql(&format!("SELECT {}", gen_col.expr)) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let expr_ast = parsed.into_iter().next().and_then(|stmt| {
+            if let sqlparser::ast::Statement::Query(q) = stmt {
+                if let sqlparser::ast::SetExpr::Select(sel) = *q.body {
+                    sel.projection.into_iter().next().and_then(|item| {
+                        if let sqlparser::ast::SelectItem::UnnamedExpr(e) = item {
+                            Some(e)
+                        } else {
+                            None
+                        }
+                    })
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        });
+        let expr_ast = match expr_ast {
+            Some(e) => e,
+            None => continue,
+        };
+        let plan_expr = match crate::planner::plan_expr(&expr_ast, table_columns, catalog) {
+            Ok(pe) => pe,
+            Err(_) => continue,
+        };
+        // Build a row from the values computed so far so the generated expr
+        // can reference sibling columns. Generated columns reading other
+        // generated columns aren't well-defined; SQLite forbids forward
+        // references but here we just use whatever values are populated.
+        let row = crate::types::Row {
+            values: values.to_vec(),
+        };
+        if let Ok(v) = super::eval::eval_expr(&plan_expr, &row, &col_names, pager, catalog) {
+            values[i] = v;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn apply_column_defaults(
     values: &mut [Value],
     explicitly_set: &[bool],

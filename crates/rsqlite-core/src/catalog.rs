@@ -50,6 +50,17 @@ pub struct ColumnDef {
     pub autoincrement: bool,
     pub column_index: usize,
     pub default_expr: Option<String>,
+    /// Set when the column is `GENERATED ALWAYS AS (...)`. Stored expression
+    /// in source form; STORED columns persist their computed values into the
+    /// row, VIRTUAL columns are left for read-time computation (not yet
+    /// implemented — VIRTUAL columns currently behave like STORED).
+    pub generated: Option<GeneratedColumn>,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedColumn {
+    pub expr: String,
+    pub stored: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +334,26 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 }
             });
 
+            let generated = col.options.iter().find_map(|opt| {
+                if let ColumnOption::Generated {
+                    generation_expr: Some(expr),
+                    generation_expr_mode,
+                    ..
+                } = &opt.option
+                {
+                    let stored = matches!(
+                        generation_expr_mode,
+                        Some(ast::GeneratedExpressionMode::Stored)
+                    );
+                    Some(GeneratedColumn {
+                        expr: expr.to_string(),
+                        stored,
+                    })
+                } else {
+                    None
+                }
+            });
+
             columns.push(ColumnDef {
                 name: col.name.value.clone(),
                 type_name: type_name.clone(),
@@ -334,6 +365,7 @@ fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {
                 autoincrement,
                 column_index: i,
                 default_expr,
+                generated,
             });
         }
 

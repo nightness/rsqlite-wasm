@@ -18,8 +18,8 @@ use super::constraints::{
 };
 use super::eval::eval_expr;
 use super::helpers::{
-    apply_column_defaults, build_index_key, build_returning_result, eval_insert_row,
-    get_table_indexes, map_query_row_to_insert, read_row_by_rowid,
+    apply_column_defaults, apply_generated_columns, build_index_key, build_returning_result,
+    eval_insert_row, get_table_indexes, map_query_row_to_insert, read_row_by_rowid,
 };
 use super::state::{set_changes, set_last_insert_rowid};
 use super::trigger::fire_triggers;
@@ -46,6 +46,22 @@ fn execute_insert_inner(
     pager: &mut Pager,
     catalog: &Catalog,
 ) -> Result<ExecResult> {
+    // Reject explicit INSERT to a generated column.
+    if let Some(targets) = &plan.target_columns {
+        if let Some(td) = catalog.get_table(&plan.table_name) {
+            for t in targets {
+                if let Some(c) = td.columns.iter().find(|c| c.name.eq_ignore_ascii_case(t)) {
+                    if c.generated.is_some() {
+                        return Err(Error::Other(format!(
+                            "cannot INSERT into generated column {}.{}",
+                            plan.table_name, c.name
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
     let table_indexes = get_table_indexes(catalog, &plan.table_name);
     let mut rows_affected = 0u64;
     let mut current_root = plan.root_page;
@@ -63,6 +79,13 @@ fn execute_insert_inner(
             apply_column_defaults(
                 &mut values,
                 &explicitly_set,
+                &plan.table_name,
+                &plan.table_columns,
+                pager,
+                catalog,
+            )?;
+            apply_generated_columns(
+                &mut values,
                 &plan.table_name,
                 &plan.table_columns,
                 pager,
@@ -158,6 +181,13 @@ fn execute_insert_inner(
         apply_column_defaults(
             &mut values,
             &explicitly_set,
+            &plan.table_name,
+            &plan.table_columns,
+            pager,
+            catalog,
+        )?;
+        apply_generated_columns(
+            &mut values,
             &plan.table_name,
             &plan.table_columns,
             pager,

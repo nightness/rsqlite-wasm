@@ -138,6 +138,13 @@ pub struct SortKey {
 #[derive(Debug, Clone)]
 pub enum Plan {
     SingleRow,
+    /// Table-valued function call like `json_each(x)`. Materialized at exec
+    /// time into a temporary QueryResult; the surrounding query treats it as
+    /// any other input source.
+    TableFunction {
+        name: String,
+        args: Vec<PlanExpr>,
+    },
     RecursiveCte {
         name: String,
         column_names: Vec<String>,
@@ -506,8 +513,40 @@ fn resolve_table_factor(
     ctes: &CteMap,
 ) -> Result<(Plan, Vec<ColumnRef>)> {
     match relation {
-        TableFactor::Table { name, alias, .. } => {
+        TableFactor::Table {
+            name, alias, args, ..
+        } => {
             let table_name = name.to_string();
+
+            // `FROM json_each(x)` — args is Some when SQL parsed it as a
+            // function call rather than a plain table name.
+            if let Some(fn_args) = args {
+                let lower = table_name.to_lowercase();
+                if matches!(lower.as_str(), "json_each" | "json_tree") {
+                    let prefix = alias
+                        .as_ref()
+                        .map(|a| a.name.value.clone())
+                        .unwrap_or_else(|| table_name.clone());
+                    let columns = json_table_function_columns(&prefix);
+                    let arg_exprs = fn_args
+                        .args
+                        .iter()
+                        .filter_map(|a| match a {
+                            ast::FunctionArg::Unnamed(ast::FunctionArgExpr::Expr(e)) => Some(e),
+                            _ => None,
+                        })
+                        .map(|e| plan_expr(e, &[], catalog))
+                        .collect::<Result<Vec<_>>>()?;
+                    let plan = Plan::TableFunction {
+                        name: lower,
+                        args: arg_exprs,
+                    };
+                    return Ok((plan, columns));
+                }
+                return Err(Error::Other(format!(
+                    "unknown table-valued function: {table_name}"
+                )));
+            }
 
             if let Some(cte_def) = ctes.get(&table_name.to_lowercase()) {
                 let prefix = alias
@@ -572,6 +611,25 @@ fn resolve_table_factor(
             "only simple table references are supported".to_string(),
         )),
     }
+}
+
+/// Standard column shape for json_each / json_tree (matches SQLite).
+fn json_table_function_columns(prefix: &str) -> Vec<ColumnRef> {
+    [
+        "key", "value", "type", "atom", "id", "parent", "fullkey", "path",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, name)| ColumnRef {
+        name: (*name).to_string(),
+        column_index: i,
+        is_rowid_alias: false,
+        table: Some(prefix.to_string()),
+        nullable: true,
+        is_primary_key: false,
+        is_unique: false,
+    })
+    .collect()
 }
 
 fn resolve_view(
