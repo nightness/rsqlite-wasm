@@ -211,25 +211,35 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             })
         }
         Plan::Scan {
-            root_page, columns, ..
-        } => execute_scan(*root_page, columns, pager),
+            table, root_page, columns, ..
+        } => {
+            let mut result = execute_scan(*root_page, columns, pager)?;
+            rehydrate_virtual_columns(&mut result, table, columns, pager, catalog)?;
+            Ok(result)
+        }
         Plan::IndexScan {
+            table,
             table_root_page,
             index_root_page,
             columns,
             index_columns,
             lookup_values,
             ..
-        } => execute_index_scan(
-            *table_root_page,
-            *index_root_page,
-            columns,
-            index_columns,
-            lookup_values,
-            pager,
-            catalog,
-        ),
+        } => {
+            let mut result = execute_index_scan(
+                *table_root_page,
+                *index_root_page,
+                columns,
+                index_columns,
+                lookup_values,
+                pager,
+                catalog,
+            )?;
+            rehydrate_virtual_columns(&mut result, table, columns, pager, catalog)?;
+            Ok(result)
+        }
         Plan::IndexRangeScan {
+            table,
             table_root_page,
             index_root_page,
             columns,
@@ -237,16 +247,20 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             lower_bound,
             upper_bound,
             ..
-        } => execute_index_range_scan(
-            *table_root_page,
-            *index_root_page,
-            columns,
-            index_column,
-            lower_bound.as_ref(),
-            upper_bound.as_ref(),
-            pager,
-            catalog,
-        ),
+        } => {
+            let mut result = execute_index_range_scan(
+                *table_root_page,
+                *index_root_page,
+                columns,
+                index_column,
+                lower_bound.as_ref(),
+                upper_bound.as_ref(),
+                pager,
+                catalog,
+            )?;
+            rehydrate_virtual_columns(&mut result, table, columns, pager, catalog)?;
+            Ok(result)
+        }
         Plan::Sort { input, keys } => {
             let mut inner = execute(input, pager, catalog)?;
             let columns = inner.columns.clone();
@@ -342,6 +356,74 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             "use execute_mut for DDL/DML statements".to_string(),
         )),
     }
+}
+
+/// After a btree scan, replace any VIRTUAL generated-column placeholders
+/// (NULL on disk) with values computed from the rest of the row. STORED
+/// generated columns are persisted at write time and need no rehydration.
+fn rehydrate_virtual_columns(
+    result: &mut QueryResult,
+    table_name: &str,
+    columns: &[crate::planner::ColumnRef],
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<()> {
+    let table_def = match catalog.get_table(table_name) {
+        Some(td) => td,
+        None => return Ok(()),
+    };
+
+    let mut virtual_targets: Vec<(usize, String)> = Vec::new();
+    for (i, col) in columns.iter().enumerate() {
+        if col.is_rowid_alias {
+            continue;
+        }
+        if let Some(cat_col) = table_def
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(&col.name))
+            && let Some(g) = &cat_col.generated
+            && !g.stored
+        {
+            virtual_targets.push((i, g.expr.clone()));
+        }
+    }
+
+    if virtual_targets.is_empty() {
+        return Ok(());
+    }
+
+    let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    for (slot, expr_src) in &virtual_targets {
+        let parsed = match rsqlite_parser::parse::parse_sql(&format!("SELECT {expr_src}")) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let expr_ast = parsed.into_iter().next().and_then(|stmt| {
+            if let sqlparser::ast::Statement::Query(q) = stmt
+                && let sqlparser::ast::SetExpr::Select(sel) = *q.body
+                && let Some(sqlparser::ast::SelectItem::UnnamedExpr(e)) =
+                    sel.projection.into_iter().next()
+            {
+                Some(e)
+            } else {
+                None
+            }
+        });
+        let Some(ast) = expr_ast else { continue };
+        let plan_expr = match crate::planner::plan_expr(&ast, columns, catalog) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        for row in &mut result.rows {
+            let v = eval_expr(&plan_expr, row, &col_names, pager, catalog)?;
+            if *slot < row.values.len() {
+                row.values[*slot] = v;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn execute_virtual_scan(

@@ -390,6 +390,12 @@ pub(super) fn apply_generated_columns(
             Some(g) => g,
             None => continue,
         };
+        // VIRTUAL columns are computed on read (see
+        // executor::rehydrate_virtual_columns). Persist NULL on disk.
+        if !gen_col.stored {
+            values[i] = Value::Null;
+            continue;
+        }
 
         let parsed = match rsqlite_parser::parse::parse_sql(&format!("SELECT {}", gen_col.expr)) {
             Ok(s) => s,

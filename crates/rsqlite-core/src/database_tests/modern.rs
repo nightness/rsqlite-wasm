@@ -1871,6 +1871,44 @@ fn generated_column_rejects_explicit_update() {
 }
 
 #[test]
+fn generated_column_virtual_computed_at_read_time() {
+    // VIRTUAL columns should NOT persist their value on disk — the
+    // executor's rehydrate step computes them when scanning. After UPDATE
+    // of the source columns, the next SELECT should reflect the new
+    // dependency value without a write to the VIRTUAL column itself.
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute(
+        "CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER GENERATED ALWAYS AS (a + b) VIRTUAL)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (a, b) VALUES (3, 4)").unwrap();
+    let r = db.query("SELECT a, b, c FROM t").unwrap();
+    assert_eq!(r.rows[0].values[2], crate::types::Value::Integer(7));
+
+    db.execute("UPDATE t SET a = 10").unwrap();
+    let r = db.query("SELECT c FROM t").unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(14));
+}
+
+#[test]
+fn generated_column_virtual_filterable_in_where() {
+    // VIRTUAL columns appearing in WHERE clauses should still match —
+    // the rehydrate step runs before the Filter, so the filter sees
+    // the computed value.
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, c INTEGER GENERATED ALWAYS AS (a * 2) VIRTUAL)",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t (a) VALUES (1), (2), (3), (4)").unwrap();
+    let r = db.query("SELECT id FROM t WHERE c = 6").unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(3));
+}
+
+#[test]
 fn generated_column_in_pragma_table_xinfo() {
     let vfs = rsqlite_vfs::memory::MemoryVfs::new();
     let mut db = Database::create(&vfs, "test.db").unwrap();

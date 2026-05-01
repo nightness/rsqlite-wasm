@@ -39,10 +39,6 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 
 ## Schema
 
-- **VIRTUAL generated columns** are computed at write time and stored
-  on disk, identical to `STORED`. SQLite's read-time semantics for
-  VIRTUAL aren't yet implemented. Functionally correct, slightly
-  larger storage footprint.
 - **Bare `rowid` references on tables without `INTEGER PRIMARY KEY`.**
   Now supported — the executor threads each row's btree rowid through
   to `eval_expr`, so `SELECT rowid FROM t` and `WHERE rowid = ?` work
