@@ -105,10 +105,16 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
   `SELECT rowid FROM e ORDER BY vec_distance_cosine(vector, ?)
   LIMIT k`. Swapping in a real HNSW graph behind the same API is
   a v0.2 perf optimization.
-- **FTS5 / R-Tree** — the virtual-table foundation (`crate::vtab`)
-  is in place; the specific search modules are deferred to v0.2.
-  Third parties can register modules today via
-  `vtab::register_module`.
+- **R-Tree `rtree`** — multi-dimensional bounding-box storage
+  shipped as a built-in virtual-table module
+  (`CREATE VIRTUAL TABLE r USING rtree(N)` for 1 ≤ N ≤ 5). Inserts
+  validate `min ≤ max` per dimension. Overlap queries are
+  brute-force in v0.1; a real R*-Tree (split heuristic, MBR
+  cascade) is a v0.2 swap behind the same module API.
+- **FTS5** — the virtual-table foundation is in place but the
+  specific full-text module (tokenizer, inverted index, BM25
+  ranking, MATCH operator) is deferred to v0.2. Third parties can
+  register custom modules via `vtab::register_module`.
 - **`LOAD_EXTENSION`** — not safe in WASM.
 - **User-defined functions** from JavaScript — supported in the
   in-worker `Database` API via `db.createFunction(name, fn, opts)`. Not
@@ -124,6 +130,7 @@ These are tracked as v0.2 candidates:
 1. sqlite_schema root-page split (btree restructure).
 2. Partial-index implication beyond the verbatim-conjunct + literal
    range cases (e.g. semantic implication of two `IN` lists).
-3. FTS5 / R-Tree modules + real HNSW graph (the brute-force
-   `vec_index` shipped today is API-shaped for the swap).
+3. FTS5 module (tokenizer + inverted index + BM25). Real HNSW
+   graph + R*-Tree split heuristic (the brute-force `vec_index`
+   and `rtree` shipped today are API-shaped for the swap).
 4. WITHOUT ROWID tables — storage layer rewrite deferred to v0.2.

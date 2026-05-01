@@ -1183,6 +1183,70 @@ fn series_module_rejects_insert() {
     assert!(res.is_err());
 }
 
+// ── rtree virtual table (multi-dimensional bounding boxes) ───────────
+
+#[test]
+fn rtree_create_and_insert_2d() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE places USING rtree(2)").unwrap();
+    db.execute("INSERT INTO places VALUES (0, 1, 0, 1)").unwrap();
+    db.execute("INSERT INTO places VALUES (5, 6, 5, 6)").unwrap();
+    let r = db
+        .query("SELECT rowid, min_0, max_0, min_1, max_1 FROM places ORDER BY rowid")
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(r.rows[0].values[0], Value::Integer(1));
+    assert_eq!(r.rows[0].values[1], Value::Real(0.0));
+    assert_eq!(r.rows[0].values[2], Value::Real(1.0));
+}
+
+#[test]
+fn rtree_query_overlap_brute_force_via_where() {
+    // The user composes a brute-force overlap query in WHERE.
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE r USING rtree(2)").unwrap();
+    db.execute("INSERT INTO r VALUES (0, 2, 0, 2)").unwrap();
+    db.execute("INSERT INTO r VALUES (5, 6, 5, 6)").unwrap();
+    db.execute("INSERT INTO r VALUES (1, 3, 1, 3)").unwrap();
+
+    // Boxes overlapping (1.5..2.5)x(1.5..2.5): rowids 1 and 3.
+    let r = db
+        .query(
+            "SELECT rowid FROM r \
+             WHERE max_0 >= 1.5 AND min_0 <= 2.5 \
+               AND max_1 >= 1.5 AND min_1 <= 2.5 \
+             ORDER BY rowid",
+        )
+        .unwrap();
+    let ids: Vec<i64> = r
+        .rows
+        .iter()
+        .filter_map(|row| {
+            if let Value::Integer(n) = row.values[0] {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 3]);
+}
+
+#[test]
+fn rtree_rejects_dim_out_of_range() {
+    let mut db = fresh();
+    assert!(db.execute("CREATE VIRTUAL TABLE r USING rtree(0)").is_err());
+    assert!(db.execute("CREATE VIRTUAL TABLE r USING rtree(6)").is_err());
+}
+
+#[test]
+fn rtree_rejects_min_greater_than_max() {
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE r USING rtree(1)").unwrap();
+    let res = db.execute("INSERT INTO r VALUES (5, 1)");
+    assert!(res.is_err());
+}
+
 // ── vec_index virtual table (typed vector storage) ───────────────────
 
 #[test]
