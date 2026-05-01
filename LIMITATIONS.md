@@ -102,15 +102,14 @@ Inherited from `sqlparser-rs` 0.55's `SQLiteDialect`:
 
 These are tracked as v0.2 candidates:
 
-1. Multi-column expression-index lookup (single-column already works).
-3. sqlite_schema root-page split (btree restructure).
-4. Native bitwise shift syntax (`<<`, `>>`) — currently only the
+1. sqlite_schema root-page split (btree restructure).
+2. Native bitwise shift syntax (`<<`, `>>`) — currently only the
    `__shl`, `__shr` function forms work. Prefix `~` is already
    supported for simple operands.
-5. `IS TRUE` / `IS FALSE` syntax with arbitrary expression LHS
+3. `IS TRUE` / `IS FALSE` syntax with arbitrary expression LHS
    (single-identifier form already works via parser pre-pass).
-6. Partial-index implication beyond the verbatim-conjunct case
+4. Partial-index implication beyond the verbatim-conjunct case
    (e.g. tighter range proves looser range).
-8. Virtual tables / FTS5 / R-Tree / HNSW vector index — major
+5. Virtual tables / FTS5 / R-Tree / HNSW vector index — major
    subsystems deferred to v0.2.
-9. WITHOUT ROWID tables — storage layer rewrite deferred to v0.2.
+6. WITHOUT ROWID tables — storage layer rewrite deferred to v0.2.
