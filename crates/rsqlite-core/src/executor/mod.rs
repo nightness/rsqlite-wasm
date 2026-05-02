@@ -326,6 +326,11 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             output_columns,
         } => execute_window(input, window_exprs, output_columns, pager, catalog),
         Plan::VirtualScan { table, columns, .. } => execute_virtual_scan(table, columns, catalog),
+        Plan::VecIndexNearest {
+            table,
+            query_expr,
+            k,
+        } => execute_vec_index_nearest(table, query_expr, *k, pager, catalog),
         Plan::VirtualFilteredScan {
             table,
             columns,
@@ -431,6 +436,55 @@ fn rehydrate_virtual_columns(
     }
 
     Ok(())
+}
+
+/// vec_index pushdown: evaluate the query vector once at run time and
+/// dispatch to HNSW search via VecIndexTable::nearest. Emits one row
+/// per neighbor, with the table's `vector` column set so projections
+/// referencing it still work.
+fn execute_vec_index_nearest(
+    table_name: &str,
+    query_expr: &crate::planner::PlanExpr,
+    k: usize,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<QueryResult> {
+    let vt = catalog
+        .virtual_tables
+        .get(&table_name.to_lowercase())
+        .ok_or_else(|| Error::Other(format!("virtual table not found: {table_name}")))?;
+    let any = vt
+        .instance
+        .as_any()
+        .ok_or_else(|| Error::Other("vec_index instance does not expose Any".into()))?;
+    let table = any
+        .downcast_ref::<crate::vtab::vec_index::VecIndexTable>()
+        .ok_or_else(|| Error::Other(format!("table {table_name} is not vec_index")))?;
+    let empty_row = Row::new(vec![]);
+    let qval = eval_expr(query_expr, &empty_row, &[], pager, catalog)?;
+    let blob = match &qval {
+        crate::types::Value::Blob(b) => b.clone(),
+        _ => {
+            return Err(Error::Other(
+                "vec_index: query vector must be a BLOB".into(),
+            ));
+        }
+    };
+    let query = crate::eval_helpers::blob_to_f32_vec(&blob)?;
+    let neighbors = table.nearest(&query, k)?;
+    let rows: Vec<Row> = neighbors
+        .into_iter()
+        .map(|(rid, _)| {
+            Row::with_rowid(
+                vec![crate::types::Value::Integer(rid)],
+                rid,
+            )
+        })
+        .collect();
+    Ok(QueryResult {
+        columns: vec!["rowid".to_string()],
+        rows,
+    })
 }
 
 fn execute_virtual_scan(

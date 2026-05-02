@@ -27,7 +27,7 @@ use rsqlite_storage::codec::Value;
 
 pub(crate) mod fts5;
 mod rtree;
-mod vec_index;
+pub(crate) mod vec_index;
 
 use crate::error::Result;
 use crate::planner::{ColumnRef, PlanExpr};

@@ -240,6 +240,16 @@ pub enum Plan {
         columns: Vec<ColumnRef>,
         predicate: Option<PlanExpr>,
     },
+    /// vec_index KNN pushdown. The planner detected the canonical
+    /// `ORDER BY vec_distance_<m>(col, ?) LIMIT k` shape and routes
+    /// directly to the HNSW backend's `nearest()`. The executor
+    /// evaluates `query_expr` once at run time and emits one row per
+    /// rowid in distance order.
+    VecIndexNearest {
+        table: String,
+        query_expr: PlanExpr,
+        k: usize,
+    },
     IndexScan {
         table: String,
         table_root_page: u32,
@@ -1152,7 +1162,79 @@ fn plan_simple_select(
         };
     }
 
+    // vec_index pushdown: recognize the canonical KNN shape
+    //   SELECT rowid FROM <vec_table> ORDER BY vec_distance_<m>(col, ?) LIMIT k
+    // and replace the Sort+Limit with a single VecIndexNearest plan that
+    // routes directly to HNSW search.
+    if let Some(replaced) = try_vec_index_nearest(&plan, catalog) {
+        plan = replaced;
+    }
+
     Ok(plan)
+}
+
+/// Detect the `Limit { Sort { ... VirtualScan } }` shape that lets a
+/// vec_index module's HNSW backend serve the query directly.
+fn try_vec_index_nearest(plan: &Plan, catalog: &Catalog) -> Option<Plan> {
+    let (limit_k, sort_inner, original) = match plan {
+        Plan::Limit {
+            input,
+            limit: Some(k),
+            offset: 0,
+        } => (*k, input.as_ref(), plan.clone()),
+        _ => return None,
+    };
+    let (sort_keys, sort_input) = match sort_inner {
+        Plan::Sort { input, keys } => (keys, input.as_ref()),
+        _ => return None,
+    };
+    if sort_keys.len() != 1 || sort_keys[0].descending {
+        return None;
+    }
+    // Strip a leading Project so SELECT rowid FROM ... still matches.
+    let scan = match sort_input {
+        Plan::Project { input, .. } => input.as_ref(),
+        other => other,
+    };
+    let (table, module, _columns) = match scan {
+        Plan::VirtualScan {
+            table,
+            module,
+            columns,
+            ..
+        } => (table.clone(), module.clone(), columns.clone()),
+        _ => return None,
+    };
+    if !module.eq_ignore_ascii_case("vec_index") {
+        return None;
+    }
+    let (fn_name, args) = match &sort_keys[0].expr {
+        PlanExpr::Function { name, args } => (name.clone(), args.clone()),
+        _ => return None,
+    };
+    if !fn_name.to_lowercase().starts_with("vec_distance_") || args.len() != 2 {
+        return None;
+    }
+    // First arg must reference the vec_index column (the module always
+    // exposes a single "vector" column).
+    let col_ok = matches!(&args[0], PlanExpr::Column(c) if c.name.eq_ignore_ascii_case("vector"));
+    if !col_ok {
+        return None;
+    }
+    // Verify the table is actually a registered vec_index instance.
+    if !catalog
+        .virtual_tables
+        .get(&table.to_lowercase())
+        .is_some_and(|v| v.module.eq_ignore_ascii_case("vec_index"))
+    {
+        return None;
+    }
+    let _ = original;
+    Some(Plan::VecIndexNearest {
+        table,
+        query_expr: args[1].clone(),
+        k: limit_k as usize,
+    })
 }
 
 fn plan_select_body(
