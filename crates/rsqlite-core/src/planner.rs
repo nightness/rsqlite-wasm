@@ -188,14 +188,24 @@ pub enum Plan {
         columns: Vec<ColumnRef>,
     },
     /// Materialize a virtual table by invoking its module's scan method.
-    /// Filters are NOT pushed down — the surrounding plan wraps the
-    /// result in a Filter for any WHERE clause. (xBestIndex is a v0.2
-    /// optimization.)
+    /// The surrounding plan wraps the result in a Filter for any WHERE
+    /// clause unless the module recognized the predicate shape — see
+    /// [`Plan::VirtualFilteredScan`].
     VirtualScan {
         table: String,
         module: String,
         args: Vec<String>,
         columns: Vec<ColumnRef>,
+    },
+    /// Module-pushed-down virtual-table scan: the module's `best_index`
+    /// hook recognized the WHERE shape and returned a pre-resolved
+    /// rowid set. The executor materializes only those rowids; any
+    /// residual conjuncts the module didn't claim live in a Filter
+    /// node wrapping this scan, just like every other scan node.
+    VirtualFilteredScan {
+        table: String,
+        columns: Vec<ColumnRef>,
+        rowids: Vec<i64>,
     },
     /// Register a new virtual table in the catalog. The module must be
     /// registered in the vtab module registry.
@@ -1307,6 +1317,8 @@ fn plan_select_body_inner(
 
         if let Some(index_plan) = try_index_scan(&plan, &predicate, &all_columns, catalog) {
             plan = index_plan;
+        } else if let Some(vt_plan) = try_vtab_pushdown(&plan, &predicate, catalog)? {
+            plan = vt_plan;
         } else {
             plan = Plan::Filter {
                 input: Box::new(plan),
@@ -1931,6 +1943,39 @@ fn plan_expr_references_alias_only(
         }
         _ => false,
     }
+}
+
+/// Ask the virtual-table module if it can pre-resolve the WHERE
+/// predicate into a rowid set (the v0.x equivalent of `xBestIndex`).
+/// Returns `None` when there's no module match, when the module
+/// declines, or when the input plan isn't a `VirtualScan`.
+fn try_vtab_pushdown(
+    current_plan: &Plan,
+    predicate: &PlanExpr,
+    catalog: &Catalog,
+) -> Result<Option<Plan>> {
+    let (table_name, columns) = match current_plan {
+        Plan::VirtualScan { table, columns, .. } => (table.clone(), columns.clone()),
+        _ => return Ok(None),
+    };
+    let Some(vt_def) = catalog.virtual_tables.get(&table_name.to_lowercase()) else {
+        return Ok(None);
+    };
+    let Some(plan) = vt_def.instance.best_index(predicate, &columns)? else {
+        return Ok(None);
+    };
+    let scan = Plan::VirtualFilteredScan {
+        table: table_name,
+        columns,
+        rowids: plan.rowids,
+    };
+    Ok(Some(match plan.residual {
+        Some(residual) => Plan::Filter {
+            input: Box::new(scan),
+            predicate: residual,
+        },
+        None => scan,
+    }))
 }
 
 fn try_index_scan(

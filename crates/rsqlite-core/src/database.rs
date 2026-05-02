@@ -539,6 +539,24 @@ fn describe_plan_recursive(
                     Value::Text(format!("{indent}SCAN CONSTANT ROW")),
                 ], rowid: None });
         }
+        Plan::VirtualScan { table, .. } => {
+            rows.push(Row {
+                values: vec![
+                    Value::Integer(my_id),
+                    Value::Integer(parent),
+                    Value::Integer(0),
+                    Value::Text(format!("{indent}SCAN VIRTUAL TABLE {table}")),
+                ], rowid: None });
+        }
+        Plan::VirtualFilteredScan { table, .. } => {
+            rows.push(Row {
+                values: vec![
+                    Value::Integer(my_id),
+                    Value::Integer(parent),
+                    Value::Integer(0),
+                    Value::Text(format!("{indent}SEARCH VIRTUAL TABLE {table} USING MODULE INDEX")),
+                ], rowid: None });
+        }
         _ => {
             rows.push(Row {
                 values: vec![

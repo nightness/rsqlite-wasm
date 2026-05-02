@@ -1501,6 +1501,67 @@ fn rtree_rejects_min_greater_than_max() {
     assert!(res.is_err());
 }
 
+#[test]
+fn rtree_pushdown_used_for_aabb_query() {
+    // The canonical AABB-overlap WHERE shape is recognized by the
+    // R-tree module's best_index hook and routed through the tree
+    // index — EXPLAIN QUERY PLAN should show the module-side index
+    // search instead of a SCAN VIRTUAL TABLE node.
+    let mut db = fresh();
+    db.execute("CREATE VIRTUAL TABLE r USING rtree(2)").unwrap();
+    db.execute("INSERT INTO r VALUES (0, 2, 0, 2)").unwrap();
+    db.execute("INSERT INTO r VALUES (5, 6, 5, 6)").unwrap();
+    db.execute("INSERT INTO r VALUES (1, 3, 1, 3)").unwrap();
+
+    let plan = db
+        .query(
+            "EXPLAIN QUERY PLAN \
+             SELECT rowid FROM r \
+             WHERE max_0 >= 1.5 AND min_0 <= 2.5 \
+               AND max_1 >= 1.5 AND min_1 <= 2.5",
+        )
+        .unwrap();
+    let plan_text: String = plan
+        .rows
+        .iter()
+        .filter_map(|r| {
+            r.values.get(3).and_then(|v| {
+                if let Value::Text(t) = v {
+                    Some(t.as_str())
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        plan_text.contains("USING MODULE INDEX"),
+        "EXPLAIN QUERY PLAN should show module-side pushdown for the AABB shape: {plan_text}"
+    );
+    // And the result still has to be correct.
+    let r = db
+        .query(
+            "SELECT rowid FROM r \
+             WHERE max_0 >= 1.5 AND min_0 <= 2.5 \
+               AND max_1 >= 1.5 AND min_1 <= 2.5 \
+             ORDER BY rowid",
+        )
+        .unwrap();
+    let ids: Vec<i64> = r
+        .rows
+        .iter()
+        .filter_map(|row| {
+            if let Value::Integer(n) = row.values[0] {
+                Some(n)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 3]);
+}
+
 // ── vec_index virtual table (typed vector storage) ───────────────────
 
 #[test]

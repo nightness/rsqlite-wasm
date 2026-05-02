@@ -326,6 +326,11 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
             output_columns,
         } => execute_window(input, window_exprs, output_columns, pager, catalog),
         Plan::VirtualScan { table, columns, .. } => execute_virtual_scan(table, columns, catalog),
+        Plan::VirtualFilteredScan {
+            table,
+            columns,
+            rowids,
+        } => execute_virtual_filtered_scan(table, columns, rowids, catalog),
         Plan::CreateTable(_)
         | Plan::CreateIndex(_)
         | Plan::Insert(_)
@@ -440,6 +445,42 @@ fn execute_virtual_scan(
     Ok(QueryResult {
         columns: column_names,
         rows,
+    })
+}
+
+/// Materialize a module-pushed-down virtual scan: scan the vtab once,
+/// keep only rows whose rowid is in the module-supplied set. Preserves
+/// the pre-sorted-ascending order of `rowids`.
+fn execute_virtual_filtered_scan(
+    table_name: &str,
+    columns: &[crate::planner::ColumnRef],
+    rowids: &[i64],
+    catalog: &Catalog,
+) -> Result<QueryResult> {
+    let vt = catalog
+        .virtual_tables
+        .get(&table_name.to_lowercase())
+        .ok_or_else(|| Error::Other(format!("virtual table not found: {table_name}")))?;
+    let scan_rows = vt.instance.scan()?;
+    let wanted: std::collections::HashSet<i64> = rowids.iter().copied().collect();
+    let mut by_rowid: std::collections::HashMap<i64, Row> = std::collections::HashMap::new();
+    for row in scan_rows {
+        if let Some(rid) = row.rowid {
+            if wanted.contains(&rid) {
+                by_rowid.insert(rid, row);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(rowids.len());
+    for rid in rowids {
+        if let Some(row) = by_rowid.remove(rid) {
+            out.push(row);
+        }
+    }
+    let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    Ok(QueryResult {
+        columns: column_names,
+        rows: out,
     })
 }
 

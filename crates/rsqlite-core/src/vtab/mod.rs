@@ -30,6 +30,7 @@ mod rtree;
 mod vec_index;
 
 use crate::error::Result;
+use crate::planner::{ColumnRef, PlanExpr};
 use crate::types::Row;
 
 /// Definition of a virtual-table module: how it parses its CREATE
@@ -47,6 +48,21 @@ pub trait Module: 'static {
     fn create(&self, table_name: &str, args: &[String]) -> Result<Rc<dyn VirtualTable>>;
 }
 
+/// A module-supplied filter pushdown for one query. Returned by
+/// [`VirtualTable::best_index`]: the module has converted the WHERE
+/// predicate into a pre-resolved candidate set of rowids, plus an
+/// optional residual conjunct the executor still has to evaluate
+/// against each row (anything the module didn't claim).
+#[derive(Debug, Clone)]
+pub struct VtabFilterPlan {
+    /// Sorted-ascending rowid candidates the executor should fetch.
+    pub rowids: Vec<i64>,
+    /// Conjuncts the module did NOT consume — the executor wraps the
+    /// pushdown scan in a Filter for these. `None` means the module
+    /// claimed the entire predicate and no further filtering is needed.
+    pub residual: Option<PlanExpr>,
+}
+
 /// A live virtual table. The catalog stores one shared `Rc<dyn
 /// VirtualTable>` per CREATE VIRTUAL TABLE, so all `&self` methods may
 /// be called concurrently across queries. Implementations needing
@@ -57,8 +73,9 @@ pub trait VirtualTable {
     fn columns(&self) -> Vec<String>;
 
     /// Produce all rows. The executor may wrap the result in a Filter
-    /// if there's a WHERE clause; a future `xBestIndex` hook would let
-    /// the module push filters down itself.
+    /// if there's a WHERE clause; modules that recognize their own
+    /// pushdown shapes via [`VirtualTable::best_index`] short-circuit
+    /// the surrounding Filter.
     fn scan(&self) -> Result<Vec<Row>>;
 
     /// Optional INSERT hook — `xUpdate` in SQLite vtab terms. Default
@@ -69,6 +86,22 @@ pub trait VirtualTable {
         Err(crate::error::Error::Other(
             "this virtual table is read-only".into(),
         ))
+    }
+
+    /// Module-side filter pushdown — the v0.x equivalent of SQLite's
+    /// `xBestIndex`. The planner calls this with the WHERE predicate
+    /// for any `Plan::Filter { Plan::VirtualScan, … }` shape. A module
+    /// that recognizes the predicate shape returns the matching
+    /// rowids (and any residual conjuncts the executor still has to
+    /// evaluate); returning `None` falls back to the default
+    /// scan-then-filter path. The default implementation returns
+    /// `None` so unmodified modules behave exactly as before.
+    fn best_index(
+        &self,
+        _predicate: &PlanExpr,
+        _columns: &[ColumnRef],
+    ) -> Result<Option<VtabFilterPlan>> {
+        Ok(None)
     }
 }
 
