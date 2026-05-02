@@ -1,6 +1,10 @@
 /target
 Cargo.lock
 .claude/
+# Coverage outputs (cargo-llvm-cov, vitest coverage-v8).
+/lcov.info
+/coverage
+/js/coverage
 *.swp
 *.swo
 *~

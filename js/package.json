@@ -28,8 +28,10 @@
     "build:meta": "cp ../README.md README.md && cp ../LICENSE LICENSE",
     "build": "npm run clean && npm run build:wasm && npm run build:ts && npm run build:meta",
     "pretest": "npm run build:wasm-node",
+    "pretest:coverage": "npm run build:wasm-node",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "prepublishOnly": "npm run build && npm test"
   },
   "keywords": [
@@ -58,6 +60,7 @@
     "node": ">=18"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.5",
     "@vitest/runner": "^4.1.5",
     "typescript": "^5.4",
     "vitest": "^4.1.5"
