@@ -800,9 +800,11 @@ fn plan_function_expr(
         "IS_FALSE",
         "IS_NOT_TRUE",
         "IS_NOT_FALSE",
-        // FTS5 module helpers (brute-force; real BM25 is v0.2).
+        // FTS5 module helpers + parser-pre-pass MATCH/rank shims.
         "FTS5_MATCH",
         "FTS5_RANK",
+        "__FTS5_MATCH_TOKEN",
+        "__FTS5_RANK_TOKEN",
     ];
 
     if KNOWN_SCALARS.contains(&name.as_str()) {

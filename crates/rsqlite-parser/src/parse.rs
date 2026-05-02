@@ -6,7 +6,9 @@ use crate::error::ParseError;
 pub fn parse_sql(sql: &str) -> Result<Vec<sqlparser::ast::Statement>, ParseError> {
     let dialect = SQLiteDialect {};
     let preprocessed = preprocess_update_limit(&preprocess_bitwise_shifts(
-        &preprocess_bitwise_not(&preprocess_is_truth_family(&preprocess_pragma(sql))),
+        &preprocess_bitwise_not(&preprocess_is_truth_family(&preprocess_fts5_match(
+            &preprocess_pragma(sql),
+        ))),
     ));
     if is_vacuum(&preprocessed) {
         return Ok(vec![make_pragma_statement("__vacuum", None)]);
@@ -1174,6 +1176,200 @@ fn preprocess_pragma(sql: &str) -> String {
         }
     }
     sql.to_string()
+}
+
+/// Rewrite `<lhs> MATCH '<query>'` into
+/// `__fts5_match_token(<lhs>, '<query>')`. SQLiteDialect doesn't accept
+/// `MATCH` as a binary operator outside of the (rarely-used) FTS3 path,
+/// so we hoist it to a scalar-function form before parsing. The
+/// rewritten function is recognized by the executor as the FTS5 entry
+/// point.
+///
+/// Conservative: only matches when the LHS is a simple identifier
+/// (`col`, `t.col`) and the RHS is a single-quoted string literal.
+fn preprocess_fts5_match(sql: &str) -> String {
+    if !contains_keyword_ci(sql, "MATCH") {
+        return sql.to_string();
+    }
+    let bytes = sql.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+
+    while i < n {
+        let ch = bytes[i] as char;
+        if ch == '\'' || ch == '"' {
+            let quote = ch;
+            out.push(ch);
+            i += 1;
+            while i < n {
+                let c = bytes[i] as char;
+                out.push(c);
+                i += 1;
+                if c == quote {
+                    if i < n && (bytes[i] as char) == quote {
+                        out.push(quote);
+                        i += 1;
+                        continue;
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+        if ch == '-' && i + 1 < n && (bytes[i + 1] as char) == '-' {
+            while i < n && (bytes[i] as char) != '\n' {
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+            continue;
+        }
+
+        if (ch == 'M' || ch == 'm') && looks_like_match_kw(bytes, i) {
+            if let Some((id_start, id)) = trailing_identifier(&out) {
+                let mut j = i + 5;
+                let saw_ws = j < n && (bytes[j] as char).is_whitespace();
+                while j < n && (bytes[j] as char).is_whitespace() {
+                    j += 1;
+                }
+                if saw_ws && j < n && (bytes[j] as char) == '\'' {
+                    let lit_start = j;
+                    j += 1;
+                    while j < n {
+                        let c = bytes[j] as char;
+                        if c == '\'' {
+                            if j + 1 < n && (bytes[j + 1] as char) == '\'' {
+                                j += 2;
+                                continue;
+                            }
+                            j += 1;
+                            break;
+                        }
+                        j += 1;
+                    }
+                    let lit = &sql[lit_start..j];
+                    let lhs_quoted = id.replace('\'', "''");
+                    out.truncate(id_start);
+                    out.push_str(&format!(
+                        "__fts5_match_token('{lhs_quoted}', {lit})"
+                    ));
+                    i = j;
+                    continue;
+                }
+            }
+        }
+
+        out.push(ch);
+        i += 1;
+    }
+    out
+}
+
+fn looks_like_match_kw(bytes: &[u8], i: usize) -> bool {
+    if i + 5 > bytes.len() {
+        return false;
+    }
+    let head = &bytes[i..i + 5];
+    if !(head[0].eq_ignore_ascii_case(&b'M')
+        && head[1].eq_ignore_ascii_case(&b'A')
+        && head[2].eq_ignore_ascii_case(&b'T')
+        && head[3].eq_ignore_ascii_case(&b'C')
+        && head[4].eq_ignore_ascii_case(&b'H'))
+    {
+        return false;
+    }
+    if i > 0 {
+        let prev = bytes[i - 1] as char;
+        if prev.is_ascii_alphanumeric() || prev == '_' {
+            return false;
+        }
+    }
+    if let Some(b) = bytes.get(i + 5) {
+        let c = *b as char;
+        if c.is_ascii_alphanumeric() || c == '_' {
+            return false;
+        }
+    }
+    true
+}
+
+fn trailing_identifier(out: &str) -> Option<(usize, String)> {
+    let trimmed = out.trim_end();
+    let bytes = trimmed.as_bytes();
+    let n = bytes.len();
+    if n == 0 {
+        return None;
+    }
+    if bytes[n - 1] == b'"' {
+        let k = n - 1;
+        if k == 0 {
+            return None;
+        }
+        let mut start = None;
+        let mut j = k;
+        while j > 0 {
+            j -= 1;
+            if bytes[j] == b'"' {
+                start = Some(j);
+                break;
+            }
+        }
+        let s = start?;
+        let mut q_start = s;
+        if q_start > 0 && bytes[q_start - 1] == b'.' {
+            let mut p = q_start - 1;
+            while p > 0 {
+                let c = bytes[p - 1] as char;
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    p -= 1;
+                } else {
+                    break;
+                }
+            }
+            q_start = p;
+        }
+        let text = String::from_utf8_lossy(&bytes[q_start..n]).into_owned();
+        return Some((q_start, text));
+    }
+    let last = bytes[n - 1] as char;
+    if !(last.is_ascii_alphanumeric() || last == '_') {
+        return None;
+    }
+    let mut start = n;
+    while start > 0 {
+        let c = bytes[start - 1] as char;
+        if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+            start -= 1;
+        } else {
+            break;
+        }
+    }
+    let text = String::from_utf8_lossy(&bytes[start..n]).into_owned();
+    Some((start, text))
+}
+
+fn contains_keyword_ci(sql: &str, kw: &str) -> bool {
+    let lower = sql.to_ascii_lowercase();
+    let needle = kw.to_ascii_lowercase();
+    let mut idx = 0;
+    while let Some(p) = lower[idx..].find(&needle) {
+        let abs = idx + p;
+        let before_ok = abs == 0
+            || !lower.as_bytes()[abs - 1].is_ascii_alphanumeric()
+                && lower.as_bytes()[abs - 1] != b'_';
+        let after = abs + needle.len();
+        let after_ok = after == lower.len()
+            || (!lower.as_bytes()[after].is_ascii_alphanumeric()
+                && lower.as_bytes()[after] != b'_');
+        if before_ok && after_ok {
+            return true;
+        }
+        idx = abs + needle.len();
+        if idx >= lower.len() {
+            break;
+        }
+    }
+    false
 }
 
 #[cfg(test)]

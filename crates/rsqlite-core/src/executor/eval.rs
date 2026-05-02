@@ -99,6 +99,13 @@ pub(super) fn eval_expr(
                 .iter()
                 .map(|a| eval_expr(a, row, columns, pager, catalog))
                 .collect::<Result<Vec<_>>>()?;
+            if name.eq_ignore_ascii_case("__fts5_match_token")
+                || name.eq_ignore_ascii_case("__fts5_rank_token")
+            {
+                return crate::vtab::fts5::scalar::eval_fts5_scalar(
+                    name, &vals, row, catalog,
+                );
+            }
             eval_scalar_function(name, &vals)
         }
         PlanExpr::Like {

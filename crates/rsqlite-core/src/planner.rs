@@ -217,11 +217,28 @@ pub enum Plan {
     },
     /// INSERT INTO a virtual table. Each row is a list of column-aligned
     /// expressions; the executor invokes the module's `insert` hook
-    /// per row. UPDATE/DELETE on virtual tables are not yet supported.
+    /// per row.
     VirtualInsert {
         table: String,
         columns: Vec<String>,
         rows: Vec<Vec<PlanExpr>>,
+    },
+    /// UPDATE on a virtual table. The executor scans the table,
+    /// evaluates `predicate` against each row, and for matches
+    /// rebuilds the column values from `assignments` and dispatches
+    /// to the module's `update` hook.
+    VirtualUpdate {
+        table: String,
+        columns: Vec<ColumnRef>,
+        assignments: Vec<(String, PlanExpr)>,
+        predicate: Option<PlanExpr>,
+    },
+    /// DELETE on a virtual table. The executor scans, filters, and
+    /// dispatches to the module's `delete` hook.
+    VirtualDelete {
+        table: String,
+        columns: Vec<ColumnRef>,
+        predicate: Option<PlanExpr>,
     },
     IndexScan {
         table: String,
@@ -2692,6 +2709,58 @@ fn plan_update(
         }
     };
 
+    // Virtual-table UPDATE: route to a separate plan variant so the
+    // executor can dispatch through the module's `update` hook.
+    if let Some(vt) = catalog.virtual_tables.get(&table_name.to_lowercase()) {
+        let columns: Vec<ColumnRef> = vt
+            .instance
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ColumnRef {
+                name: name.clone(),
+                column_index: i,
+                is_rowid_alias: false,
+                table: Some(vt.name.clone()),
+                nullable: true,
+                is_primary_key: false,
+                is_unique: false,
+            })
+            .collect();
+        let mut assigns = Vec::new();
+        for assignment in assignments {
+            let col_name = match &assignment.target {
+                ast::AssignmentTarget::ColumnName(name) => name.to_string(),
+                ast::AssignmentTarget::Tuple(_) => {
+                    return Err(Error::Other(
+                        "tuple assignment not supported in UPDATE on virtual table".into(),
+                    ));
+                }
+            };
+            let expr = plan_expr(&assignment.value, &columns, catalog)?;
+            assigns.push((col_name, expr));
+        }
+        let predicate = selection
+            .map(|s| plan_expr(s, &columns, catalog))
+            .transpose()?;
+        if from.is_some() {
+            return Err(Error::Other(
+                "UPDATE … FROM is not supported on virtual tables".into(),
+            ));
+        }
+        if returning.is_some() {
+            return Err(Error::Other(
+                "RETURNING is not supported in UPDATE on virtual tables".into(),
+            ));
+        }
+        return Ok(Plan::VirtualUpdate {
+            table: vt.name.clone(),
+            columns,
+            assignments: assigns,
+            predicate,
+        });
+    }
+
     let table_def = catalog
         .get_table(&table_name)
         .ok_or_else(|| Error::Other(format!("table not found: {table_name}")))?;
@@ -2807,6 +2876,40 @@ fn plan_delete(delete: &ast::Delete, catalog: &Catalog) -> Result<Plan> {
             ));
         }
     };
+
+    // Virtual-table DELETE: dispatch through the module's `delete` hook.
+    if let Some(vt) = catalog.virtual_tables.get(&table_name.to_lowercase()) {
+        let columns: Vec<ColumnRef> = vt
+            .instance
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(i, name)| ColumnRef {
+                name: name.clone(),
+                column_index: i,
+                is_rowid_alias: false,
+                table: Some(vt.name.clone()),
+                nullable: true,
+                is_primary_key: false,
+                is_unique: false,
+            })
+            .collect();
+        let predicate = delete
+            .selection
+            .as_ref()
+            .map(|s| plan_expr(s, &columns, catalog))
+            .transpose()?;
+        if delete.returning.is_some() {
+            return Err(Error::Other(
+                "RETURNING is not supported in DELETE on virtual tables".into(),
+            ));
+        }
+        return Ok(Plan::VirtualDelete {
+            table: vt.name.clone(),
+            columns,
+            predicate,
+        });
+    }
 
     let table_def = catalog
         .get_table(&table_name)

@@ -18,3 +18,5 @@ rsqlite-vfs = { workspace = true, features = ["native"] }
 sqlparser = { workspace = true }
 lru = { workspace = true }
 thiserror = { workspace = true }
+unicode-segmentation = "1.11"
+unicode-normalization = "0.1"

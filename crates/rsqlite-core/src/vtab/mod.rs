@@ -103,6 +103,44 @@ pub trait VirtualTable {
     ) -> Result<Option<VtabFilterPlan>> {
         Ok(None)
     }
+
+    /// Optional UPDATE hook. Replace the row at `rowid` with `values`
+    /// in column order. Default is read-only.
+    fn update(&self, _rowid: i64, _values: &[Value]) -> Result<()> {
+        Err(crate::error::Error::Other(
+            "this virtual table does not support UPDATE".into(),
+        ))
+    }
+
+    /// Optional DELETE hook. Remove the row at `rowid`. Default is
+    /// read-only.
+    fn delete(&self, _rowid: i64) -> Result<()> {
+        Err(crate::error::Error::Other(
+            "this virtual table does not support DELETE".into(),
+        ))
+    }
+
+    /// Allow the module to expose itself as `Any` so the engine can
+    /// downcast to module-specific persistence hooks (e.g. FTS5 index
+    /// serialization). Default `None` is fine for modules that don't
+    /// need it.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// Optional persistence hook: produce a serialized snapshot of any
+    /// on-disk state the module wants the engine to write to a shadow
+    /// table. Returns `None` when there's nothing to persist (default).
+    fn snapshot(&self) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// Optional persistence hook: restore from a snapshot produced by
+    /// [`VirtualTable::snapshot`]. Modules that don't persist state
+    /// ignore this. Returning an error rolls the open back.
+    fn restore(&self, _snapshot: &[u8]) -> Result<()> {
+        Ok(())
+    }
 }
 
 thread_local! {

@@ -1375,10 +1375,15 @@ fn fts5_match_ignores_punctuation() {
 }
 
 #[test]
-fn fts5_create_rejects_multi_column_for_now() {
+fn fts5_accepts_multi_column_with_per_column_weights() {
     let mut db = fresh();
-    let res = db.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)");
-    assert!(res.is_err());
+    db.execute("CREATE VIRTUAL TABLE docs USING fts5(title, body)").unwrap();
+    db.execute("INSERT INTO docs(title, body) VALUES ('Quick fox', 'jumps over')")
+        .unwrap();
+    let r = db
+        .query("SELECT rowid FROM docs WHERE __fts5_match_token('docs', 'quick')")
+        .unwrap();
+    assert_eq!(r.rows.len(), 1);
 }
 
 // ── WITHOUT ROWID tables (syntax accepted, PK uniqueness enforced) ────

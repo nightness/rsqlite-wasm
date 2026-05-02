@@ -221,10 +221,23 @@ impl Catalog {
         let mut indexes = HashMap::new();
         let mut views = HashMap::new();
         let mut triggers = HashMap::new();
+        let mut virtual_tables = HashMap::new();
 
         for entry in &schema_entries {
             match entry.entry_type.as_str() {
                 "table" => {
+                    // Recognize CREATE VIRTUAL TABLE entries — stored as
+                    // type='table' (matching SQLite) but routed via the
+                    // vtab module registry.
+                    if let Some(sql) = &entry.sql {
+                        if is_create_virtual(sql) {
+                            if let Some(vt_def) = parse_virtual_table_def(&entry.name, sql) {
+                                virtual_tables
+                                    .insert(entry.name.to_lowercase(), vt_def);
+                                continue;
+                            }
+                        }
+                    }
                     if let Some(table_def) = parse_table_def(entry)? {
                         tables.insert(table_def.name.to_lowercase(), table_def);
                     }
@@ -264,7 +277,7 @@ impl Catalog {
             views,
             triggers,
             index_stats,
-            virtual_tables: HashMap::new(),
+            virtual_tables,
         })
     }
 
@@ -301,8 +314,89 @@ impl Catalog {
         self.indexes = fresh.indexes;
         self.views = fresh.views;
         self.triggers = fresh.triggers;
+        // Preserve any live virtual-table instances (so reload mid-
+        // session doesn't drop their state); merge in any newly-seen
+        // declarations the schema has but we don't yet.
+        for (k, v) in fresh.virtual_tables {
+            self.virtual_tables.entry(k).or_insert(v);
+        }
         Ok(())
     }
+}
+
+fn is_create_virtual(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    let upper: String = trimmed.chars().take(21).collect::<String>().to_uppercase();
+    upper.starts_with("CREATE VIRTUAL TABLE")
+}
+
+fn parse_virtual_table_def(name: &str, sql: &str) -> Option<VirtualTableDef> {
+    let lower_idx = sql.to_uppercase().find("USING")?;
+    let after_using = sql[lower_idx + 5..].trim_start();
+    let open = after_using.find('(')?;
+    let close = after_using.rfind(')')?;
+    let module = after_using[..open].trim().to_string();
+    let args_str = after_using[open + 1..close].to_string();
+    let args = split_module_args(&args_str);
+    if module.is_empty() {
+        return None;
+    }
+
+    let module_def = crate::vtab::lookup_module(&module)?;
+    let instance = match module_def.create(name, &args) {
+        Ok(i) => i,
+        Err(_) => return None,
+    };
+    Some(VirtualTableDef {
+        name: name.to_string(),
+        module,
+        args,
+        instance,
+    })
+}
+
+/// Best-effort comma split that respects parentheses and quotes.
+fn split_module_args(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut depth = 0i32;
+    let mut in_quote: Option<char> = None;
+    for ch in s.chars() {
+        if let Some(q) = in_quote {
+            buf.push(ch);
+            if ch == q {
+                in_quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                buf.push(ch);
+                in_quote = Some(ch);
+            }
+            '(' => {
+                depth += 1;
+                buf.push(ch);
+            }
+            ')' => {
+                depth -= 1;
+                buf.push(ch);
+            }
+            ',' if depth == 0 => {
+                let t = buf.trim().to_string();
+                if !t.is_empty() {
+                    out.push(t);
+                }
+                buf.clear();
+            }
+            _ => buf.push(ch),
+        }
+    }
+    let t = buf.trim().to_string();
+    if !t.is_empty() {
+        out.push(t);
+    }
+    out
 }
 
 fn parse_table_def(entry: &SchemaEntry) -> Result<Option<TableDef>> {

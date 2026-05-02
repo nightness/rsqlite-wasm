@@ -36,13 +36,15 @@ impl Database {
     pub fn open(vfs: &dyn Vfs, path: &str) -> Result<Self> {
         let mut pager = Pager::open(vfs, path)?;
         let catalog = Catalog::load(&mut pager)?;
-        Ok(Self {
+        let mut db = Self {
             pager,
             catalog,
             plan_cache: LruCache::new(NonZero::new(PLAN_CACHE_SIZE).unwrap()),
             vfs: vfs.clone_box(),
             attached: HashMap::new(),
-        })
+        };
+        db.rehydrate_persisted_vtabs()?;
+        Ok(db)
     }
 
     /// Create a new database at `path` on the given VFS. The file is
@@ -51,13 +53,47 @@ impl Database {
     pub fn create(vfs: &dyn Vfs, path: &str) -> Result<Self> {
         let mut pager = Pager::create(vfs, path)?;
         let catalog = Catalog::load(&mut pager)?;
-        Ok(Self {
+        let mut db = Self {
             pager,
             catalog,
             plan_cache: LruCache::new(NonZero::new(PLAN_CACHE_SIZE).unwrap()),
             vfs: vfs.clone_box(),
             attached: HashMap::new(),
-        })
+        };
+        db.rehydrate_persisted_vtabs()?;
+        Ok(db)
+    }
+
+    /// Walk every catalog-loaded virtual table; for FTS5 instances,
+    /// pull the latest snapshot from the shadow table and restore.
+    /// No-op for fresh databases or non-persistent modules.
+    fn rehydrate_persisted_vtabs(&mut self) -> Result<()> {
+        let names: Vec<String> = self
+            .catalog
+            .virtual_tables
+            .values()
+            .filter(|v| v.module.eq_ignore_ascii_case("fts5"))
+            .map(|v| v.name.clone())
+            .collect();
+        for name in names {
+            let vt = self
+                .catalog
+                .virtual_tables
+                .get(&name.to_lowercase())
+                .cloned();
+            let Some(vt) = vt else { continue };
+            if let Some(any) = vt.instance.as_any() {
+                if let Some(table) = any.downcast_ref::<crate::vtab::fts5::Fts5Table>() {
+                    crate::vtab::fts5::persist::restore_if_present(
+                        table,
+                        &name,
+                        &mut self.pager,
+                        &self.catalog,
+                    )?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Same as [`Self::query`] but binds `?` placeholders to `params` first.

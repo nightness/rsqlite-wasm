@@ -357,7 +357,9 @@ pub fn execute(plan: &Plan, pager: &mut Pager, catalog: &Catalog) -> Result<Quer
         | Plan::AttachDatabase { .. }
         | Plan::DetachDatabase { .. }
         | Plan::CreateVirtualTable { .. }
-        | Plan::VirtualInsert { .. } => Err(Error::Other(
+        | Plan::VirtualInsert { .. }
+        | Plan::VirtualUpdate { .. }
+        | Plan::VirtualDelete { .. } => Err(Error::Other(
             "use execute_mut for DDL/DML statements".to_string(),
         )),
     }
@@ -505,7 +507,105 @@ fn execute_virtual_insert(
         vt.instance.insert(&values)?;
         affected += 1;
     }
+    persist_fts5_if_needed(table_name, vt, pager, catalog)?;
     Ok(ExecResult::affected(affected))
+}
+
+fn execute_virtual_update(
+    table_name: &str,
+    columns: &[crate::planner::ColumnRef],
+    assignments: &[(String, crate::planner::PlanExpr)],
+    predicate: Option<&crate::planner::PlanExpr>,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<ExecResult> {
+    let vt = catalog
+        .virtual_tables
+        .get(&table_name.to_lowercase())
+        .ok_or_else(|| Error::Other(format!("virtual table not found: {table_name}")))?;
+    let rows = vt.instance.scan()?;
+    let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let mut affected = 0u64;
+    for row in rows {
+        let rowid = row
+            .rowid
+            .ok_or_else(|| Error::Other("virtual-table row missing rowid".into()))?;
+        if let Some(p) = predicate {
+            let v = eval::eval_expr(p, &row, &column_names, pager, catalog)?;
+            if !crate::eval_helpers::is_truthy(&v) {
+                continue;
+            }
+        }
+        let mut new_values = row.values.clone();
+        for (col_name, expr) in assignments {
+            let idx = columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                .ok_or_else(|| {
+                    Error::Other(format!("unknown column in UPDATE: {col_name}"))
+                })?;
+            let new = eval::eval_expr(expr, &row, &column_names, pager, catalog)?;
+            if idx < new_values.len() {
+                new_values[idx] = new;
+            }
+        }
+        vt.instance.update(rowid, &new_values)?;
+        affected += 1;
+    }
+    persist_fts5_if_needed(table_name, vt, pager, catalog)?;
+    Ok(ExecResult::affected(affected))
+}
+
+fn execute_virtual_delete(
+    table_name: &str,
+    columns: &[crate::planner::ColumnRef],
+    predicate: Option<&crate::planner::PlanExpr>,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<ExecResult> {
+    let vt = catalog
+        .virtual_tables
+        .get(&table_name.to_lowercase())
+        .ok_or_else(|| Error::Other(format!("virtual table not found: {table_name}")))?;
+    let rows = vt.instance.scan()?;
+    let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+    let mut to_delete = Vec::new();
+    for row in rows {
+        let rowid = row
+            .rowid
+            .ok_or_else(|| Error::Other("virtual-table row missing rowid".into()))?;
+        if let Some(p) = predicate {
+            let v = eval::eval_expr(p, &row, &column_names, pager, catalog)?;
+            if !crate::eval_helpers::is_truthy(&v) {
+                continue;
+            }
+        }
+        to_delete.push(rowid);
+    }
+    let mut affected = 0u64;
+    for rid in to_delete {
+        vt.instance.delete(rid)?;
+        affected += 1;
+    }
+    persist_fts5_if_needed(table_name, vt, pager, catalog)?;
+    Ok(ExecResult::affected(affected))
+}
+
+fn persist_fts5_if_needed(
+    table_name: &str,
+    vt: &crate::catalog::VirtualTableDef,
+    pager: &mut Pager,
+    catalog: &Catalog,
+) -> Result<()> {
+    if !vt.module.eq_ignore_ascii_case("fts5") {
+        return Ok(());
+    }
+    if let Some(any) = vt.instance.as_any() {
+        if let Some(table) = any.downcast_ref::<crate::vtab::fts5::Fts5Table>() {
+            crate::vtab::fts5::persist::write_snapshot(table, table_name, pager, catalog)?;
+        }
+    }
+    Ok(())
 }
 
 fn execute_create_virtual_table(
@@ -513,6 +613,7 @@ fn execute_create_virtual_table(
     module: &str,
     args: &[String],
     if_not_exists: bool,
+    pager: &mut Pager,
     catalog: &mut Catalog,
 ) -> Result<ExecResult> {
     let key = name.to_lowercase();
@@ -522,25 +623,42 @@ fn execute_create_virtual_table(
         }
         return Err(Error::Other(format!("virtual table {name} already exists")));
     }
-    // Verify the module is registered up front so the failure surfaces
-    // at CREATE time instead of every query that touches the table.
     let module_def = crate::vtab::lookup_module(module).ok_or_else(|| {
         Error::Other(format!("virtual-table module not registered: {module}"))
     })?;
-    // Build the live instance once and stash it in the catalog so
-    // stateful modules see all subsequent reads/writes against the
-    // same backing data.
     let instance = module_def.create(name, args)?;
     catalog.virtual_tables.insert(
-        key,
+        key.clone(),
         crate::catalog::VirtualTableDef {
             name: name.to_string(),
             module: module.to_string(),
             args: args.to_vec(),
-            instance,
+            instance: instance.clone(),
         },
     );
+
+    // FTS5 persistence: stand up the shadow table + schema marker and
+    // rehydrate from any existing snapshot. Other modules opt out by
+    // leaving `snapshot` returning `None`.
+    if module.eq_ignore_ascii_case("fts5") {
+        if let Some(any) = instance.as_any() {
+            if let Some(table) = any.downcast_ref::<crate::vtab::fts5::Fts5Table>() {
+                let create_sql = render_fts5_create_sql(name, args);
+                crate::vtab::fts5::persist::ensure_persistence(
+                    name, &create_sql, pager, catalog,
+                )?;
+                crate::vtab::fts5::persist::restore_if_present(
+                    table, name, pager, catalog,
+                )?;
+            }
+        }
+    }
     Ok(ExecResult::affected(0))
+}
+
+fn render_fts5_create_sql(name: &str, args: &[String]) -> String {
+    let inner = args.join(", ");
+    format!("CREATE VIRTUAL TABLE {name} USING fts5({inner})")
 }
 
 pub fn execute_mut(plan: &Plan, pager: &mut Pager, catalog: &mut Catalog) -> Result<ExecResult> {
@@ -583,12 +701,30 @@ pub fn execute_mut(plan: &Plan, pager: &mut Pager, catalog: &mut Catalog) -> Res
             module,
             args,
             if_not_exists,
-        } => execute_create_virtual_table(name, module, args, *if_not_exists, catalog),
+        } => execute_create_virtual_table(name, module, args, *if_not_exists, pager, catalog),
         Plan::VirtualInsert {
             table,
             columns,
             rows,
         } => execute_virtual_insert(table, columns, rows, pager, catalog),
+        Plan::VirtualUpdate {
+            table,
+            columns,
+            assignments,
+            predicate,
+        } => execute_virtual_update(
+            table,
+            columns,
+            assignments,
+            predicate.as_ref(),
+            pager,
+            catalog,
+        ),
+        Plan::VirtualDelete {
+            table,
+            columns,
+            predicate,
+        } => execute_virtual_delete(table, columns, predicate.as_ref(), pager, catalog),
         // REINDEX is currently a no-op: our btree implementation doesn't
         // suffer from the corruption modes (collation changes, etc.) that
         // real SQLite addresses with REINDEX. Accepted for tool compat.
