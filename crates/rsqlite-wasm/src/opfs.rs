@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use rsqlite_vfs::{LockType, OpenFlags, SyncFlags, Vfs, VfsError, VfsFile};
 use wasm_bindgen::JsCast;
@@ -12,9 +13,23 @@ use web_sys::{
 
 pub struct OpfsVfs {
     root_dir: FileSystemDirectoryHandle,
-    handles: RefCell<HashMap<String, FileSystemSyncAccessHandle>>,
+    /// Shared handle map. `clone_box` (used by sqlite to hand the VFS to
+    /// multiple owners) bumps the `Arc` rather than deep-cloning the
+    /// HashMap — every JS-side `FileSystemSyncAccessHandle` then has a
+    /// single owning record, and `Drop` only closes the OPFS handles
+    /// when the last `OpfsVfs` reference goes away. The previous
+    /// `RefCell<HashMap<...>>` shape produced "file already closed"
+    /// errors: `RefCell::clone` deep-cloned the map but the JS handles
+    /// inside were JsValue refs to the *same* underlying OPFS handles,
+    /// so dropping the first cloned VFS closed the handles still in
+    /// active use by the second.
+    handles: Arc<RefCell<HashMap<String, FileSystemSyncAccessHandle>>>,
 }
 
+// `Arc<RefCell<HashMap<…JsValue…>>>` would normally be `!Send`, but
+// wasm32 is single-threaded — there's no scenario where the VFS is
+// shared across threads. The unsafe assert mirrors the `web_sys`
+// convention for JS-handle wrappers.
 unsafe impl Send for OpfsVfs {}
 
 impl OpfsVfs {
@@ -26,7 +41,7 @@ impl OpfsVfs {
         let root_dir: FileSystemDirectoryHandle = dir_val.unchecked_into();
         Ok(Self {
             root_dir,
-            handles: RefCell::new(HashMap::new()),
+            handles: Arc::new(RefCell::new(HashMap::new())),
         })
     }
 
@@ -88,9 +103,14 @@ impl Vfs for OpfsVfs {
     }
 
     fn clone_box(&self) -> Box<dyn Vfs> {
+        // Share the handles map via Arc — every `OpfsVfs` issued by
+        // `clone_box` references the same underlying OPFS handles, so
+        // dropping one clone doesn't close the handles still being
+        // used by the others. `Drop` only closes when the last VFS
+        // reference goes away (`Arc::strong_count == 1`).
         Box::new(OpfsVfs {
             root_dir: self.root_dir.clone(),
-            handles: self.handles.clone(),
+            handles: Arc::clone(&self.handles),
         })
     }
 }
@@ -157,8 +177,15 @@ impl VfsFile for OpfsFile {
 
 impl Drop for OpfsVfs {
     fn drop(&mut self) {
-        for handle in self.handles.borrow().values() {
-            handle.close();
+        // Only close the OPFS sync access handles when this is the
+        // last `OpfsVfs` referencing them — otherwise we'd close
+        // handles that other live `OpfsVfs` clones (via `clone_box`)
+        // are still actively using, surfacing as `InvalidStateError:
+        // file already closed` on subsequent VFS calls.
+        if Arc::strong_count(&self.handles) == 1 {
+            for handle in self.handles.borrow().values() {
+                handle.close();
+            }
         }
     }
 }
