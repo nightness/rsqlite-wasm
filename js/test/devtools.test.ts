@@ -213,3 +213,83 @@ describe("exposeForDevtools", () => {
     expect((r as { ok: boolean }).ok).toBe(false);
   });
 });
+
+// ── WorkerDatabase-shaped (Promise-returning) mocks ───────────────────────
+
+interface AsyncMockDb {
+  exec(sql: string, params?: unknown[]): Promise<number>;
+  execMany(sql: string): Promise<void>;
+  query<T = unknown>(sql: string, params?: unknown[]): Promise<T[]>;
+  queryOne<T = unknown>(sql: string, params?: unknown[]): Promise<T | null>;
+  isClosed: boolean;
+  log: Array<{ op: string; sql: string }>;
+}
+
+function asyncMockDb(): AsyncMockDb {
+  const log: AsyncMockDb["log"] = [];
+  let closed = false;
+  return {
+    log,
+    get isClosed() {
+      return closed;
+    },
+    set isClosed(v) {
+      closed = v;
+    },
+    async exec(sql) {
+      log.push({ op: "exec", sql });
+      return 1;
+    },
+    async execMany(sql) {
+      log.push({ op: "execMany", sql });
+    },
+    async query(sql) {
+      log.push({ op: "query", sql });
+      return [{ via: "worker" }] as never;
+    },
+    async queryOne(sql) {
+      log.push({ op: "queryOne", sql });
+      return { one: 1 } as never;
+    },
+  } as unknown as AsyncMockDb;
+}
+
+async function callOpAsync(name: string, op: string, sql: string) {
+  const id = bridge().invoke(name, op, sql);
+  // Drain a few microtasks because the dispatcher awaits the async db
+  for (let i = 0; i < 4; i++) await Promise.resolve();
+  return bridge().poll(id);
+}
+
+describe("exposeForDevtools — async (WorkerDatabase-style)", () => {
+  it("awaits Promise-returning query", async () => {
+    const db = asyncMockDb();
+    exposeForDevtools(db as never);
+    const r = await callOpAsync("main", "query", "SELECT 1");
+    expect(r.pending).toBe(false);
+    expect((r as { ok: boolean }).ok).toBe(true);
+    expect((r as { value: unknown }).value).toEqual([{ via: "worker" }]);
+  });
+
+  it("bumps changeCounter only AFTER the async exec resolves", async () => {
+    const db = asyncMockDb();
+    exposeForDevtools(db as never);
+    const promise = db.exec("UPDATE t SET a=1");
+    // Counter should still be 0 — exec hasn't resolved yet
+    expect(bridge().info("main")?.changeCounter).toBe(0);
+    await promise;
+    expect(bridge().info("main")?.changeCounter).toBe(1);
+  });
+
+  it("propagates rejected Promises as error", async () => {
+    const db = asyncMockDb();
+    db.query = async () => {
+      throw new Error("worker exploded");
+    };
+    exposeForDevtools(db as never);
+    const r = await callOpAsync("main", "query", "SELECT 1");
+    expect(r.pending).toBe(false);
+    expect((r as { ok: boolean }).ok).toBe(false);
+    expect((r as { error: { message: string } }).error.message).toBe("worker exploded");
+  });
+});

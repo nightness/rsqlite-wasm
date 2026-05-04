@@ -23,8 +23,20 @@
 // `changeCounter` increments on every successful exec/execMany so the panel
 // can poll for "did the page write since I last looked" and refresh.
 
-import type { Database } from "./index.js";
 import type { Row, SqlValue } from "./types.js";
+
+/**
+ * Structural type that both {@link import("./index.js").Database} (sync)
+ * and {@link import("./worker-proxy.js").WorkerDatabase} (Promise-returning)
+ * satisfy. Either flavour can be exposed through the bridge.
+ */
+export interface DevtoolsDatabase {
+  exec(sql: string, params?: SqlValue[]): number | Promise<number>;
+  execMany(sql: string): void | Promise<void>;
+  query<T extends Row = Row>(sql: string, params?: SqlValue[]): T[] | Promise<T[]>;
+  queryOne<T extends Row = Row>(sql: string, params?: SqlValue[]): (T | null) | Promise<T | null>;
+  readonly isClosed: boolean;
+}
 
 const GLOBAL_KEY = "__BRAINWIRES_RSQLITE_DEVTOOLS__" as const;
 const PROTOCOL_VERSION = 1;
@@ -46,7 +58,7 @@ type PollResult = PendingResult | SuccessResult | FailureResult;
 
 interface RegisteredDb {
   name: string;
-  db: Database;
+  db: DevtoolsDatabase;
   changeCounter: number;
 }
 
@@ -100,7 +112,7 @@ export interface ExposeForDevtoolsOptions {
  *   exposeForDevtools(db, { disabled: process.env.NODE_ENV === 'production' });
  */
 export function exposeForDevtools(
-  db: Database,
+  db: DevtoolsDatabase,
   options?: ExposeForDevtoolsOptions
 ): () => void {
   if (options?.disabled) return () => {};
@@ -128,21 +140,34 @@ export function exposeForDevtools(
   }
 
   // Wrap exec/execMany so the page's own writes bump changeCounter.
-  // We only wrap once per db, even on re-exposure under a new name.
+  // Tolerates both sync (Database) and Promise-returning (WorkerDatabase)
+  // signatures. We only wrap once per db, even on re-exposure under a new name.
   const wrappedKey = "__bwOpfsWrapped" as const;
   if (!(db as unknown as Record<string, boolean>)[wrappedKey]) {
-    const origExec = db.exec.bind(db);
-    const origExecMany = db.execMany.bind(db);
-    db.exec = function (sql: string, params?: SqlValue[]): number {
-      const r = origExec(sql, params);
+    const origExec = db.exec.bind(db) as DevtoolsDatabase["exec"];
+    const origExecMany = db.execMany.bind(db) as DevtoolsDatabase["execMany"];
+    const bumpAfter = <T,>(r: T | Promise<T>): T | Promise<T> => {
+      if (r && typeof (r as { then?: unknown }).then === "function") {
+        return (r as Promise<T>).then((v) => {
+          const entry = state.byName.get(name);
+          if (entry) entry.changeCounter++;
+          return v;
+        });
+      }
       const entry = state.byName.get(name);
       if (entry) entry.changeCounter++;
       return r;
     };
-    db.execMany = function (sql: string): void {
-      origExecMany(sql);
-      const entry = state.byName.get(name);
-      if (entry) entry.changeCounter++;
+    (db as { exec: DevtoolsDatabase["exec"] }).exec = function (
+      sql: string,
+      params?: SqlValue[],
+    ) {
+      return bumpAfter(origExec(sql, params));
+    };
+    (db as { execMany: DevtoolsDatabase["execMany"] }).execMany = function (
+      sql: string,
+    ) {
+      return bumpAfter(origExecMany(sql));
     };
     Object.defineProperty(db, wrappedKey, {
       value: true,
@@ -184,8 +209,10 @@ function installBridge(state: InternalState): BridgeRoot {
       state.results.set(id, { pending: true });
       const entry = state.byName.get(name);
       // Run in a microtask so the caller gets the id back synchronously
-      // and can immediately start polling.
-      Promise.resolve().then(() => {
+      // and can immediately start polling. Awaits the db method so both
+      // sync (Database) and Promise-returning (WorkerDatabase) implementations
+      // are supported transparently.
+      Promise.resolve().then(async () => {
         if (!entry) {
           state.results.set(id, {
             pending: false,
@@ -204,11 +231,12 @@ function installBridge(state: InternalState): BridgeRoot {
         }
         try {
           let value: unknown;
-          if (op === "query") value = entry.db.query<Row>(sql, params);
-          else if (op === "queryOne") value = entry.db.queryOne<Row>(sql, params);
-          else if (op === "exec") value = entry.db.exec(sql, params);
+          if (op === "query") value = await entry.db.query<Row>(sql, params);
+          else if (op === "queryOne")
+            value = await entry.db.queryOne<Row>(sql, params);
+          else if (op === "exec") value = await entry.db.exec(sql, params);
           else if (op === "execMany") {
-            entry.db.execMany(sql);
+            await entry.db.execMany(sql);
             value = undefined;
           } else {
             throw new Error(`unknown op: ${op}`);
