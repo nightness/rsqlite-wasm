@@ -100,6 +100,49 @@ db.close();
 
 The WASM module runs inside a Web Worker. The `WorkerDatabase` class is a main-thread proxy that communicates via `postMessage`. OPFS is used for persistence when available, with IndexedDB as a fallback.
 
+## DevTools (Brainwires OPFS extension)
+
+The [Brainwires OPFS](https://github.com/Brainwires/opfs-extension) Chrome
+DevTools extension auto-detects rsqlite-wasm databases stored in OPFS and gives
+you a full SQLite IDE — schema browser, paginated table data, FK click-through,
+saved queries, EXPLAIN — inside DevTools.
+
+By default the panel loads a *snapshot* of the shards from disk (read-only
+when the page holds the live `SyncAccessHandle` — OPFS sync handles are
+exclusive). To get **fully live editing** through the panel — UPDATEs, DDL,
+auto-refresh when your app writes — opt in with one line at startup:
+
+```typescript
+import { Database, exposeForDevtools } from "rsqlite-wasm";
+
+const db = await Database.open("chat", { backend: "opfs" });
+exposeForDevtools(db, { name: "chat" });
+
+// Tree-shake out in production:
+exposeForDevtools(db, {
+  name: "chat",
+  disabled: process.env.NODE_ENV === "production",
+});
+```
+
+How it works:
+
+- Installs `window.__BRAINWIRES_RSQLITE_DEVTOOLS__`, a tiny postMessage-style
+  bridge that lets the panel route SQL through *your* `Database` instance —
+  no second handle, no lock conflict.
+- Wraps `db.exec` / `db.execMany` so writes from your own code bump a
+  `changeCounter`. The panel polls that counter to auto-refresh when your app
+  changes data behind its back.
+- Returns a `release()` function to unregister (handy for HMR / teardown).
+- `disabled: true` is a no-op — same source compiles to nothing in production.
+- Multiple databases can be exposed under different names. The panel shows
+  one **● live (name)** badge per registered db.
+
+When the bridge isn't installed, the panel still works — it reads the file
+bytes directly and shows the schema + data. Edits attempted in that mode
+surface a friendly "page is using this file, expose it for live editing"
+message.
+
 ## Database size & sharding
 
 Browsers cap individual storage files well below SQLite-class workloads (OPFS and IndexedDB both have per-file size limits, often ≤ 4 GB). To escape that cap, rsqlite-wasm transparently shards each logical database across multiple backing files via a `MultiplexVfs` layer.

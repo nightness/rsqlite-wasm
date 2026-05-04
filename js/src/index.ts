@@ -1,5 +1,6 @@
 export type { SqlValue, BindParams, Row, DatabaseOptions } from "./types.js";
 export { WorkerDatabase } from "./worker-proxy.js";
+export { exposeForDevtools, type ExposeForDevtoolsOptions } from "./devtools.js";
 
 interface WasmModule {
   default: (input?: RequestInfo | URL) => Promise<unknown>;
