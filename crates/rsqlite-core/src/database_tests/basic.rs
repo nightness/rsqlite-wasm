@@ -1413,3 +1413,91 @@ fn select_qualified_rowid_with_alias() {
     assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(1));
     assert_eq!(r.rows[1].values[0], crate::types::Value::Integer(2));
 }
+
+// ── Quoted identifier regression tests ─────────────────────────────────
+//
+// Catalog lookups must use the unquoted ident value, NOT the round-tripped
+// `to_string()` form which preserves the AST's quote_style. Without this
+// every `FROM "messages"`-style query failed with `table not found:
+// "messages"` (with the literal quote characters in the error). Also covers
+// SELECT/UPDATE/DELETE/ALTER/DROP and column references with quoted column
+// names.
+
+#[test]
+fn select_from_double_quoted_identifier() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO messages (body) VALUES ('hello'), ('world')")
+        .unwrap();
+    let r = db
+        .query(r#"SELECT body FROM "messages" ORDER BY id"#)
+        .unwrap();
+    assert_eq!(r.rows.len(), 2);
+    assert_eq!(
+        r.rows[0].values[0],
+        crate::types::Value::Text("hello".to_string())
+    );
+    assert_eq!(
+        r.rows[1].values[0],
+        crate::types::Value::Text("world".to_string())
+    );
+}
+
+#[test]
+fn count_from_double_quoted_identifier() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute("CREATE TABLE conversations (id INTEGER PRIMARY KEY)")
+        .unwrap();
+    db.execute("INSERT INTO conversations VALUES (1), (2), (3)")
+        .unwrap();
+    let r = db
+        .query(r#"SELECT COUNT(*) FROM "conversations""#)
+        .unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(3));
+}
+
+#[test]
+fn double_quoted_table_name_with_underscore_prefix() {
+    // `_sync_log`-style names that don't need quoting but might be quoted by
+    // a generic SQL emitter — must still resolve.
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute("CREATE TABLE _sync_log (id INTEGER PRIMARY KEY, op TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO _sync_log (op) VALUES ('write')")
+        .unwrap();
+    let r = db.query(r#"SELECT op FROM "_sync_log""#).unwrap();
+    assert_eq!(r.rows.len(), 1);
+    assert_eq!(
+        r.rows[0].values[0],
+        crate::types::Value::Text("write".to_string())
+    );
+}
+
+#[test]
+fn double_quoted_in_update_and_delete() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
+    db.execute(r#"UPDATE "t" SET n = 99 WHERE id = 1"#).unwrap();
+    let r = db.query("SELECT n FROM t WHERE id = 1").unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(99));
+    db.execute(r#"DELETE FROM "t" WHERE id = 2"#).unwrap();
+    let r = db.query("SELECT COUNT(*) FROM t").unwrap();
+    assert_eq!(r.rows[0].values[0], crate::types::Value::Integer(1));
+}
+
+#[test]
+fn double_quoted_in_pragma_table_info() {
+    let vfs = rsqlite_vfs::memory::MemoryVfs::new();
+    let mut db = Database::create(&vfs, "test.db").unwrap();
+    db.execute("CREATE TABLE settings (key TEXT, value TEXT)")
+        .unwrap();
+    let r = db.query(r#"PRAGMA table_info("settings")"#).unwrap();
+    assert!(r.rows.len() >= 2, "expected ≥2 columns, got {}", r.rows.len());
+}

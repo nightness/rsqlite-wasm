@@ -5,6 +5,24 @@ use sqlparser::ast::{self, Expr, SetExpr, Statement, TableFactor};
 use crate::catalog::Catalog;
 use crate::error::{Error, Result};
 
+/// Extract the unquoted last segment of an [`ObjectName`] for catalog lookups.
+///
+/// Calling [`ToString::to_string`] on a sqlparser `ObjectName` re-emits with the
+/// AST's `quote_style`, so `FROM "messages"` round-trips to the literal string
+/// `"messages"` (quote characters and all). The catalog stores plain identifiers
+/// keyed by lowercase, so the lookup never matches and the user gets a
+/// `table not found: "messages"` error even when the table exists.
+///
+/// This helper returns just the unquoted value of the rightmost ident, which
+/// is what every catalog-keyed comparison wants.
+fn object_name_value(name: &ast::ObjectName) -> String {
+    name.0
+        .last()
+        .and_then(|p| p.as_ident())
+        .map(|i| i.value.clone())
+        .unwrap_or_default()
+}
+
 type CteMap = HashMap<String, CteDef>;
 
 #[derive(Clone)]
@@ -406,10 +424,11 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
             names,
             ..
         } => {
-            let name = names
-                .first()
-                .ok_or_else(|| Error::Other("DROP requires a name".to_string()))?
-                .to_string();
+            let name = object_name_value(
+                names
+                    .first()
+                    .ok_or_else(|| Error::Other("DROP requires a name".to_string()))?,
+            );
             match object_type {
                 ast::ObjectType::Table => Ok(Plan::DropTable {
                     table_name: name,
@@ -429,7 +448,7 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
         Statement::AlterTable {
             name, operations, ..
         } => {
-            let table_name = name.to_string();
+            let table_name = object_name_value(name);
             if operations.len() != 1 {
                 return Err(Error::Other(
                     "only single ALTER TABLE operations supported".to_string(),
@@ -453,7 +472,7 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
                     table_name: new_name,
                 } => Ok(Plan::AlterTableRename {
                     old_name: table_name,
-                    new_name: new_name.to_string(),
+                    new_name: object_name_value(new_name),
                 }),
                 other => Err(Error::Other(format!(
                     "unsupported ALTER TABLE operation: {other}"
@@ -467,7 +486,7 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
             columns: _view_columns,
             ..
         } => {
-            let view_name = name.to_string();
+            let view_name = object_name_value(name);
             if !or_replace {
                 if catalog.get_view(&view_name).is_some() {
                     return Err(Error::Other(format!("view {view_name} already exists")));
@@ -576,6 +595,7 @@ pub fn plan_statement(stmt: &Statement, catalog: &Catalog) -> Result<Plan> {
             }
             let argument = value.as_ref().map(|v| match v {
                 ast::Value::SingleQuotedString(s) => s.clone(),
+                ast::Value::DoubleQuotedString(s) => s.clone(),
                 ast::Value::Number(n, _) => n.clone(),
                 other => other.to_string(),
             });
@@ -624,7 +644,7 @@ fn resolve_table_factor(
         TableFactor::Table {
             name, alias, args, ..
         } => {
-            let table_name = name.to_string();
+            let table_name = object_name_value(name);
 
             // `FROM json_each(x)` — args is Some when SQL parsed it as a
             // function call rather than a plain table name.
@@ -917,13 +937,13 @@ fn body_references_name(body: &SetExpr, name: &str) -> bool {
         SetExpr::Select(s) => {
             for item in &s.from {
                 if let ast::TableFactor::Table { name: tname, .. } = &item.relation {
-                    if tname.to_string().to_lowercase() == name {
+                    if object_name_value(tname).to_lowercase() == name {
                         return true;
                     }
                 }
                 for join in &item.joins {
                     if let ast::TableFactor::Table { name: tname, .. } = &join.relation {
-                        if tname.to_string().to_lowercase() == name {
+                        if object_name_value(tname).to_lowercase() == name {
                             return true;
                         }
                     }
@@ -1603,7 +1623,7 @@ fn build_using_condition(
 ) -> Result<Option<PlanExpr>> {
     let mut conjuncts: Vec<PlanExpr> = Vec::new();
     for name_obj in names {
-        let name = name_obj.to_string();
+        let name = object_name_value(name_obj);
         let left = left_cols
             .iter()
             .enumerate()
@@ -1669,7 +1689,7 @@ fn combine_and(mut conjuncts: Vec<PlanExpr>) -> Option<PlanExpr> {
 }
 
 fn plan_create_table(ct: &ast::CreateTable, catalog: &Catalog) -> Result<Plan> {
-    let table_name = ct.name.to_string();
+    let table_name = object_name_value(&ct.name);
 
     if let Some(query) = &ct.query {
         let query_plan = plan_select(query, catalog, &HashMap::new())?;
@@ -2575,8 +2595,12 @@ fn build_remaining_predicate(predicate: &PlanExpr, index_columns: &[String]) -> 
 }
 
 fn plan_create_index(ci: &ast::CreateIndex) -> Result<Plan> {
-    let index_name = ci.name.as_ref().map(|n| n.to_string()).unwrap_or_default();
-    let table_name = ci.table_name.to_string();
+    let index_name = ci
+        .name
+        .as_ref()
+        .map(object_name_value)
+        .unwrap_or_default();
+    let table_name = object_name_value(&ci.table_name);
 
     let columns: Vec<String> = ci.columns.iter().map(|c| c.expr.to_string()).collect();
     let predicate = ci.predicate.as_ref().map(|p| p.to_string());
@@ -2595,7 +2619,7 @@ fn plan_create_index(ci: &ast::CreateIndex) -> Result<Plan> {
 
 fn plan_insert(insert: &ast::Insert, catalog: &Catalog) -> Result<Plan> {
     let table_name = match &insert.table {
-        ast::TableObject::TableName(name) => name.to_string(),
+        ast::TableObject::TableName(name) => object_name_value(name),
         _ => {
             return Err(Error::Other(
                 "only simple table names are supported in INSERT".to_string(),
@@ -2783,7 +2807,7 @@ fn plan_update(
     catalog: &Catalog,
 ) -> Result<Plan> {
     let table_name = match &table.relation {
-        TableFactor::Table { name, .. } => name.to_string(),
+        TableFactor::Table { name, .. } => object_name_value(name),
         _ => {
             return Err(Error::Other(
                 "only simple table references are supported in UPDATE".to_string(),
@@ -2872,7 +2896,7 @@ fn plan_update(
                 .first()
                 .ok_or_else(|| Error::Other("UPDATE FROM requires a table".to_string()))?;
             let from_table_name = match &first.relation {
-                TableFactor::Table { name, .. } => name.to_string(),
+                TableFactor::Table { name, .. } => object_name_value(name),
                 _ => {
                     return Err(Error::Other(
                         "only simple table references are supported in UPDATE FROM".to_string(),
@@ -2951,7 +2975,7 @@ fn plan_delete(delete: &ast::Delete, catalog: &Catalog) -> Result<Plan> {
     }
 
     let table_name = match &tables[0].relation {
-        TableFactor::Table { name, .. } => name.to_string(),
+        TableFactor::Table { name, .. } => object_name_value(name),
         _ => {
             return Err(Error::Other(
                 "only simple table references are supported in DELETE".to_string(),
